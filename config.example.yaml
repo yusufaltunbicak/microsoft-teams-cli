@@ -1,0 +1,22 @@
+# Teams CLI configuration
+# Copy to ~/.config/teams-cli/config.yaml
+
+# Max items to display by default
+max_messages: 25
+max_chats: 25
+
+# Region (auto-detected during login)
+# region: emea
+
+# Browser settings
+browser:
+  headless: false
+  timeout: 120
+
+# Output format: table or json
+output_format: table
+
+# Anti-detection jitter (seconds)
+jitter:
+  read_base: 0.3
+  write_base: 2.0
