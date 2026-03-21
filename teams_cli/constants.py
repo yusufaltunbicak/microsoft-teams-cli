@@ -10,7 +10,6 @@ TEAMS_URL = "https://teams.cloud.microsoft"
 # API base templates (region substituted at runtime)
 CHATSVC_BASE = "https://teams.cloud.microsoft/api/chatsvc/{region}/v1"
 MT_BASE = "https://teams.cloud.microsoft/api/mt/{region}/beta"
-CSA_BASE = "https://teams.cloud.microsoft/api/csa/{region}/api/v3"
 UPS_BASE = "https://teams.cloud.microsoft/ups/{region}/v1"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SUBSTRATE_SEARCH_BASE = "https://substrate.office.com/searchservice/api/v2/query"

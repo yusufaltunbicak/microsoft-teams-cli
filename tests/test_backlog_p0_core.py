@@ -11,9 +11,7 @@ import teams_cli.commands._common as commands_common
 from teams_cli.client import TeamsClient, TokenExpiredError
 from teams_cli.models import (
     Attachment,
-    Channel,
     Chat,
-    Team,
     User,
     _detect_chat_type,
     _extract_inline_images,
@@ -159,25 +157,6 @@ def test_ups_put_uses_presence_token_and_write_jitter(teams_client: TeamsClient,
         f"{teams_client._ups}/me/forceavailability/",
         {"Authorization": "Bearer presence"},
         json_data={"availability": "Busy"},
-    )
-
-
-def test_csa_get_prefers_csa_token_when_available(teams_client: TeamsClient, mocker):
-    headers = mocker.patch.object(
-        teams_client._session,
-        "browser_headers",
-        return_value={"Authorization": "Bearer csa"},
-    )
-    request = mocker.patch.object(teams_client, "_request_with_retry", return_value={"value": []})
-
-    teams_client._csa_get("/teams")
-
-    headers.assert_called_once_with(teams_client._csa_token or teams_client._ic3)
-    request.assert_called_once_with(
-        "GET",
-        f"{teams_client._csa}/teams",
-        {"Authorization": "Bearer csa"},
-        params=None,
     )
 
 
@@ -345,52 +324,6 @@ def test_mark_message_unread_uses_bookmark_payload_and_quoted_path(
     }
 
 
-def test_get_joined_teams_passes_skip_to_graph_and_assigns_numbers(teams_client: TeamsClient):
-    captured: dict[str, object] = {}
-
-    def fake_graph_get(path: str, params: dict | None = None) -> dict:
-        captured["path"] = path
-        captured["params"] = params
-        return {
-            "value": [
-                {
-                    "id": "team-2",
-                    "displayName": "Platform",
-                    "description": "Platform team",
-                }
-            ]
-        }
-
-    teams_client._graph_get = fake_graph_get  # type: ignore[method-assign]
-
-    teams = teams_client.get_joined_teams(skip=1)
-
-    assert captured == {"path": "/me/joinedTeams", "params": {"$skip": 1}}
-    assert [(team.id, team.display_num) for team in teams] == [("team-2", 1)]
-
-
-def test_get_channels_skips_client_side_and_assigns_numbers(teams_client: TeamsClient):
-    captured: dict[str, object] = {}
-    teams_client._resolve_team_id = lambda team_num: "team-1"  # type: ignore[method-assign]
-
-    def fake_graph_get(path: str, params: dict | None = None) -> dict:
-        captured["path"] = path
-        return {
-            "value": [
-                {"id": "channel-1", "displayName": "General"},
-                {"id": "channel-2", "displayName": "Release"},
-            ]
-        }
-
-    teams_client._graph_get = fake_graph_get  # type: ignore[method-assign]
-
-    channels = teams_client.get_channels("5", skip=1)
-
-    assert captured["path"] == "/teams/team-1/channels"
-    assert [(channel.id, channel.display_num) for channel in channels] == [("channel-2", 1)]
-    assert teams_client._id_map["channel_5_1"] == "channel-2"
-
-
 def test_user_parsers_and_string_representation():
     from_api = User.from_api(
         {
@@ -515,22 +448,6 @@ def test_message_model_parses_system_messages_reactions_and_attachments():
     )
 
     assert system_message.content == "[ThreadActivity/TopicUpdate]"
-
-
-def test_team_and_channel_parsers_cover_alternate_keys():
-    team = Team.from_api({"teamId": "team-1", "name": "Platform", "teamDescription": "Core"})
-    channel = Channel.from_api(
-        {"channelId": "channel-2", "name": "Release", "description": "Ship room"},
-        team_id="team-1",
-    )
-
-    assert team == Team(id="team-1", name="Platform", description="Core", is_archived=False)
-    assert channel == Channel(
-        id="channel-2",
-        name="Release",
-        description="Ship room",
-        team_id="team-1",
-    )
 
 
 def test_model_helpers_cover_edge_cases():

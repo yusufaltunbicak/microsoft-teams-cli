@@ -14,7 +14,6 @@ import teams_cli.commands.attachments as cmd_attachments
 import teams_cli.commands.auth as cmd_auth
 import teams_cli.commands.mark_read as cmd_mark_read
 import teams_cli.commands.presence as cmd_presence
-import teams_cli.commands.teams_channels as cmd_teams
 import teams_cli.config as config_mod
 import teams_cli.formatter as formatter
 import teams_cli.serialization as serialization_mod
@@ -266,19 +265,3 @@ def test_set_status_invalid_expiry_exits_with_error(runner, console_capture, moc
 
     assert result.exit_code == 1
     assert "Error: bad time" in console_capture.getvalue()
-
-
-def test_teams_command_applies_offset_before_printing(runner, mocker, make_team):
-    teams = [make_team(team_id="team-1", name="Alpha"), make_team(team_id="team-2", name="Beta")]
-
-    class FakeClient:
-        def get_joined_teams(self):
-            return teams
-
-    print_teams = mocker.patch.object(cmd_teams, "print_teams")
-    mocker.patch.object(cmd_teams, "_get_client", return_value=FakeClient())
-
-    result = runner.invoke(cli_mod.cli, ["teams", "--offset", "1"])
-
-    assert result.exit_code == 0
-    print_teams.assert_called_once_with([teams[1]])

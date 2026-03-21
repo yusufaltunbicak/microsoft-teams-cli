@@ -7,7 +7,7 @@ import respx
 from httpx import HTTPStatusError, Request, Response
 
 from teams_cli.client import TeamsClient
-from teams_cli.models import Attachment, Team
+from teams_cli.models import Attachment
 
 
 def test_get_chat_messages_applies_after_before_filters(teams_client):

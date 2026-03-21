@@ -24,16 +24,15 @@ python -m pytest              # run mocked/unit suite
 
 1. **IC3 Chat Service** (`teams.cloud.microsoft/api/chatsvc/{region}/v1/`) — primary API for chats, messages, conversations, group chat creation, message edit/delete. Uses IC3 bearer token (aud: `ic3.teams.office.com`).
 2. **Substrate Search** (`substrate.office.com/searchservice/api/v2/query`) — primary search API. Uses Substrate token (aud: `substrate.office.com`). Falls back to scanning recent chats if no substrate token.
-3. **CSA** (`teams.cloud.microsoft/api/csa/{region}/api/v3/`) — teams/channels listing. Uses `chatsvcagg.teams.microsoft.com` token when available.
-4. **Graph API** (`graph.microsoft.com/v1.0/`) — user search, file uploads, 1:1 chat creation. Uses Graph token when available, IC3 fallback.
-5. **UPS Presence** (`teams.cloud.microsoft/ups/{region}/v1/`) — presence read (`getpresence`) and write (`forceavailability`). Used for both get and set status (Graph presence endpoints are unreliable).
+3. **Graph API** (`graph.microsoft.com/v1.0/`) — user search, file uploads, 1:1 chat creation. Uses Graph token when available, IC3 fallback.
+4. **UPS Presence** (`teams.cloud.microsoft/ups/{region}/v1/`) — presence read (`getpresence`) and write (`forceavailability`). Used for both get and set status (Graph presence endpoints are unreliable).
 
 ### Module responsibilities
 
 - **`cli.py`** — Thin entry point. Defines Click group, imports `commands/` package.
 - **`commands/`** — Command modules, each with a `register(cli)` function:
   - `_common.py` — Shared helpers: `_get_client`, `_handle_api_error`, `cfg`, `should_json`, `_parse_schedule_time`, `_format_size`, `VALID_REACTIONS`.
-  - `auth.py` — `login`, `whoami`
+  - `auth.py` — `login` (with `--with-token` for CI/CD), `whoami`
   - `chat.py` — `chats`, `chat`, `read`, `unread`
   - `send.py` — `chat-send`, `reply`, `send`, `send-file`
   - `search.py` — `search`, `user-search`
@@ -41,15 +40,14 @@ python -m pytest              # run mocked/unit suite
   - `message_manage.py` — `edit`, `delete`
   - `group_chat.py` — `group-chat`, `forward`
   - `mark_read.py` — `mark-read` (supports `--unread`)
-  - `teams_channels.py` — `teams`, `channels`
   - `schedule.py` — `schedule`, `schedule-list`, `schedule-cancel`, `schedule-run`
   - `presence.py` — `status`, `set-status`
   - `attachments.py` — `attachments`
 - **`exceptions.py`** — Structured hierarchy: `TeamsCliError` → `TokenExpiredError`, `RateLimitError`, `ResourceNotFoundError`, `AuthRequiredError`, `ApiError`.
-- **`client.py`** — `TeamsClient` wraps multi-token routing (IC3/Graph/MT/CSA/UPS). Two-level ID mapping. HTTP helpers (`_ic3_get`, `_ic3_post`, `_ic3_put`, `_ic3_delete`, `_graph_get`, `_ups_put`, etc.) handle jitter/auth/response parsing.
-- **`auth.py`** — Playwright-based login. Opens Teams web, extracts MSAL tokens from localStorage via JS evaluation. Classifies by audience (`ic3`, `graph`, `presence`, `csa`, `substrate`). Detects region from GTM localStorage key.
+- **`client.py`** — `TeamsClient` wraps multi-token routing (IC3/Graph/MT/UPS). Two-level ID mapping. HTTP helpers (`_ic3_get`, `_ic3_post`, `_ic3_put`, `_ic3_delete`, `_graph_get`, `_ups_put`, etc.) handle jitter/auth/response parsing.
+- **`auth.py`** — Playwright-based login + `login_with_token()` for CI/CD (stdin). Opens Teams web, extracts MSAL tokens from localStorage via JS evaluation. Classifies by audience (`ic3`, `graph`, `presence`, `csa`, `substrate`). Detects region from GTM localStorage key.
 - **`anti_detection.py`** — `BrowserSession`: request jitter, full browser headers (Sec-Fetch-*, sec-ch-ua-*), proxy support, configurable timeout.
-- **`models.py`** — Dataclasses (User, Chat, Message, Reaction, Attachment, Team, Channel) with `from_api()` class methods that normalize various API response formats.
+- **`models.py`** — Dataclasses (User, Chat, Message, Reaction, Attachment) with `from_api()` class methods that normalize various API response formats.
 - **`formatter.py`** — Rich tables output. `Console(stderr=True)` so JSON piping to stdout stays clean.
 - **`serialization.py`** — JSON envelope format `{ok, schema_version, data}` with `to_json()` and `to_json_error()`. Auto-JSON when stdout is piped (`is_piped()`).
 - **`scheduler.py`** — Local scheduled message tracking (Teams has no native scheduled send).
@@ -58,9 +56,10 @@ python -m pytest              # run mocked/unit suite
 
 ### Key patterns
 
-- **Two-level ID mapping**: Chats get `#1, #2...`, messages also get `#1, #2...` (globally, not per-chat). Stored in `id_map.json` with `chats` and `messages` sections. Teams use `team_{n}` keys. Max 500 entries per section (LRU eviction).
-- **Token routing**: `_ic3_get`/`_ic3_post`/`_ic3_put`/`_ic3_delete` for chat service, `_graph_get`/`_graph_post` for Graph, `_csa_get` for teams listing, `_ups_post`/`_ups_put` for presence. All HTTP methods go through `_request_with_retry` which handles 429 rate limiting with automatic exponential backoff (up to 3 retries).
-- **Multi-token auth**: MSAL stores multiple tokens in localStorage. We extract `ic3`, `graph`, `presence`, `csa`, `substrate` by audience and keep polling briefly after IC3 appears so secondary tokens are cached too. Token flow: env var `TEAMS_IC3_TOKEN` → cached `tokens.json` → Playwright login.
+- **Two-level ID mapping**: Chats get `#1, #2...`, messages also get `#1, #2...` (globally, not per-chat). Stored in `id_map.json` with `chats` and `messages` sections. Max 500 entries per section (LRU eviction).
+- **Token routing**: `_ic3_get`/`_ic3_post`/`_ic3_put`/`_ic3_delete` for chat service, `_graph_get`/`_graph_post` for Graph, `_ups_post`/`_ups_put` for presence. All HTTP methods go through `_request_with_retry` which handles 429 rate limiting with automatic exponential backoff (up to 3 retries).
+- **Multi-token auth**: MSAL stores multiple tokens in localStorage. We extract `ic3`, `graph`, `presence`, `csa`, `substrate` by audience and keep polling briefly after IC3 appears so secondary tokens are cached too. Token flow: env var `TEAMS_IC3_TOKEN` → cached `tokens.json` → `--with-token` stdin → Playwright login.
+- **Non-interactive login**: `teams login --with-token` reads from stdin (plain IC3 token or JSON bundle). Supports `--region` flag. For CI/CD, cron jobs, and automation pipelines.
 - **Region-specific endpoints**: All API URLs include region (emea/amer/apac), auto-detected from GTM localStorage during login.
 - **HTML messages**: Teams content is always HTML (`<p>text</p>`). `send_message()` wraps plain text in `<p>` tags. `_strip_html()` uses BeautifulSoup for display.
 - **JSON envelope**: All `--json` output uses `{ok: true, schema_version: "1.0", data: ...}` format. Errors return `{ok: false, error: "message"}`. Auto-JSON when stdout is piped (no `--json` flag needed).
