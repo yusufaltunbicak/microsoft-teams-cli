@@ -663,9 +663,13 @@ class TeamsClient:
         """Get current presence status, with UPS fallback for tenants that block Graph."""
         try:
             return self._graph_get("/me/presence")
-        except httpx.HTTPStatusError as exc:
-            if exc.response is None or exc.response.status_code != 403 or not self._presence_token:
+        except (httpx.HTTPStatusError, TokenExpiredError) as exc:
+            # Fall back to UPS if Graph returns 403 (blocked) or 401 (expired)
+            if not self._presence_token:
                 raise
+            if isinstance(exc, httpx.HTTPStatusError):
+                if exc.response is None or exc.response.status_code not in (401, 403):
+                    raise
 
         resp = self._ups_post(
             "/presence/getpresence/",
