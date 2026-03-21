@@ -116,6 +116,83 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
     return tokens
 
 
+def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
+    """Validate and cache tokens provided via stdin.
+
+    Args:
+        raw_input: Either a plain IC3 token string or a JSON object with token keys.
+        region: Region override (emea/amer/apac). Used when input is a plain token.
+
+    Returns:
+        Tokens dict with keys: ic3, graph, presence, csa, substrate, region, user_id
+
+    Raises:
+        ValueError: If input is empty, JWT format is invalid, or JSON is malformed.
+        RuntimeError: If IC3 token fails live validation.
+    """
+    raw_input = raw_input.strip()
+    if not raw_input:
+        raise ValueError("No token provided via stdin.")
+
+    # Detect format: JSON bundle or plain token
+    parsed = None
+    try:
+        candidate = json.loads(raw_input)
+        if isinstance(candidate, dict):
+            parsed = candidate
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    if parsed is not None:
+        # JSON bundle path
+        ic3 = parsed.get("ic3", "")
+        if not ic3:
+            raise ValueError("JSON input must include an 'ic3' token.")
+
+        parts = ic3.split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid token format for 'ic3'. Expected JWT with 3 parts (header.payload.signature).")
+
+        # Validate optional tokens
+        optional_keys = ("graph", "presence", "csa", "substrate")
+        for key in optional_keys:
+            val = parsed.get(key, "")
+            if val and len(val.split(".")) != 3:
+                raise ValueError(f"Invalid JWT format for '{key}' token.")
+
+        tokens = {
+            "ic3": ic3,
+            "graph": parsed.get("graph", ""),
+            "presence": parsed.get("presence", ""),
+            "csa": parsed.get("csa", ""),
+            "substrate": parsed.get("substrate", ""),
+            "region": parsed.get("region", region),
+            "user_id": _decode_user_id(ic3),
+        }
+    else:
+        # Plain token path
+        parts = raw_input.split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid token format. Expected JWT with 3 parts (header.payload.signature).")
+
+        tokens = {
+            "ic3": raw_input,
+            "graph": "",
+            "presence": "",
+            "csa": "",
+            "substrate": "",
+            "region": region,
+            "user_id": _decode_user_id(raw_input),
+        }
+
+    # Live validation
+    if not verify_tokens(tokens):
+        raise RuntimeError("Token validation failed. The IC3 token may be expired or invalid.")
+
+    _save_tokens(tokens)
+    return tokens
+
+
 def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
     """Extract MSAL tokens from Teams localStorage via JS evaluation."""
     result = page.evaluate("""() => {
