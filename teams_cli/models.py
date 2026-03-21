@@ -66,6 +66,7 @@ class Chat:
     def from_api(cls, data: dict) -> Chat:
         # IC3 chat service format
         thread_props = data.get("threadProperties", {})
+        props = data.get("properties", {})
         last_msg = data.get("lastMessage", {})
 
         # Get topic or member names for 1:1
@@ -104,7 +105,7 @@ class Chat:
             last_message_time=last_time,
             last_message_sender=last_sender,
             members=members,
-            unread_count=_parse_unread_count(thread_props),
+            unread_count=_parse_unread_count(thread_props, props, last_time),
         )
 
     @classmethod
@@ -279,7 +280,11 @@ class Attachment:
         )
 
 
-def _parse_unread_count(thread_props: dict) -> int:
+def _parse_unread_count(
+    thread_props: dict,
+    props: dict | None = None,
+    last_msg_time: datetime | None = None,
+) -> int:
     """Extract unread count from thread properties, handling both dict and string formats."""
     ch = thread_props.get("consumptionhorizon")
     if isinstance(ch, dict):
@@ -294,6 +299,17 @@ def _parse_unread_count(thread_props: dict) -> int:
             return count
     except (ValueError, TypeError):
         pass
+    # Check properties.consumptionhorizon (string format: "read_ts;delivered_ts;msg_id")
+    if props and last_msg_time:
+        ch_str = props.get("consumptionhorizon", "")
+        if ch_str:
+            try:
+                read_ts_ms = int(ch_str.split(";")[0])
+                msg_ts_ms = int(last_msg_time.timestamp() * 1000)
+                if msg_ts_ms > read_ts_ms:
+                    return 1
+            except (ValueError, TypeError, IndexError):
+                pass
     return 0
 
 
