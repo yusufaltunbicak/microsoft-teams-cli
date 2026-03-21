@@ -149,7 +149,7 @@ class TeamsClient:
             # Skip special conversations
             if conv_id.startswith("48:") or conv_id.startswith("28:"):
                 continue
-            chat = Chat.from_api(conv)
+            chat = Chat.from_api(conv, my_user_id=self._user_id)
             if unread_only and chat.unread_count == 0:
                 continue
             chats.append(chat)
@@ -1127,6 +1127,17 @@ class TeamsClient:
             f"/chats/{conv_id}/messages/{msg_id}/unsetReaction",
             json_data={"reactionType": unicode_emoji},
             beta=True,
+        )
+
+    def mark_chat_read(self, chat_num: str) -> dict:
+        """Mark an entire chat as read by setting consumptionhorizon to now."""
+        conv_id = self._resolve_chat_id(chat_num)
+        from urllib.parse import quote
+        now_ms = str(int(time.time() * 1000))
+        horizon_value = f"{now_ms};{now_ms};{now_ms}"
+        return self._ic3_put(
+            f"/users/ME/conversations/{quote(conv_id, safe='')}/properties?name=consumptionhorizon",
+            json_data={"consumptionhorizon": horizon_value},
         )
 
     def mark_message_read(self, msg_num: str) -> dict:
