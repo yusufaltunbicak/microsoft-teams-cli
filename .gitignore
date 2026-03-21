@@ -46,3 +46,6 @@ browser-state.json
 id_map.json
 scheduled.json
 user_profile.json
+
+# Screenshots for README (user selects which to include)
+screenshots/

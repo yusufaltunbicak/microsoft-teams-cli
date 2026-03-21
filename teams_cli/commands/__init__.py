@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import click
 
-from . import attachments, auth, chat, group_chat, mark_read, message_manage, presence, reactions, schedule, search, send
+from . import attachments, auth, chat, group_chat, mark_read, message_manage, presence, reactions, schedule, search, send, summary
 
 _MODULES = [
     auth,
@@ -18,6 +18,7 @@ _MODULES = [
     attachments,
     message_manage,
     group_chat,
+    summary,
 ]
 
 
