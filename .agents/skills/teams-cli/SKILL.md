@@ -1,8 +1,8 @@
 ---
 name: teams-cli
-description: CLI skill for Microsoft Teams to read chats, send/edit/delete/forward messages, create group chats, search, manage reactions, files, and presence from the terminal without API keys or admin consent
+description: CLI skill for Microsoft Teams to read chats, send messages, search, manage reactions, files, channels, and presence from the terminal without API keys or admin consent
 author: yusufaltunbicak
-version: "0.5.0"
+version: "0.4.0"
 tags:
   - teams
   - microsoft-teams
@@ -15,7 +15,7 @@ tags:
 
 # teams-cli Skill
 
-Use this skill when the user wants to read, send, search, or manage Microsoft Teams chats from the terminal. No Azure app registration, admin consent, or API keys required.
+Use this skill when the user wants to read, send, search, or manage Microsoft Teams chats and channels from the terminal. No Azure app registration, admin consent, or API keys required.
 
 ## Prerequisites
 
@@ -48,7 +48,6 @@ teams whoami             # Verify current user
 ```bash
 teams chats                             # List recent chats
 teams chats -n 50                       # Limit count
-teams chats --offset 10                 # Skip first 10
 teams chats --unread                    # Unread only
 teams chats --json                      # JSON output
 ```
@@ -66,7 +65,6 @@ teams unread --json                     # JSON output
 ```bash
 teams chat 3                            # Read messages from chat #3
 teams chat 3 -n 50                      # Limit message count
-teams chat 3 --offset 25                # Skip first 25 messages
 teams chat 3 --json                     # JSON output
 ```
 
@@ -89,32 +87,6 @@ teams chat-send 3 "Hello team!"                     # Send to existing chat #3
 teams chat-send 3 "Meeting at 3pm" -y               # Skip confirmation
 ```
 
-### Reply
-
-```bash
-teams reply 42 "On it." -y             # Reply to message #42
-```
-
-### Edit & Delete
-
-```bash
-teams edit 42 "Updated text" -y         # Edit a sent message
-teams delete 42 -y                      # Delete a message
-```
-
-### Forward
-
-```bash
-teams forward 42 3 -y                   # Forward message #42 to chat #3
-teams forward 42 3 --comment "FYI" -y   # Forward with comment
-```
-
-### Group Chat
-
-```bash
-teams group-chat "Alice" "Bob" --topic "Project X" --message "Kickoff!" -y
-```
-
 ### Send Files
 
 ```bash
@@ -132,24 +104,19 @@ teams search "project" --chat 3                      # Search within chat #3
 teams search "hello" --from "John"                   # Filter by sender
 teams search "meeting" --after 2026-03-01            # After date
 teams search "review" --before 2026-02-28            # Before date
-teams search "quarterly" --offset 10 --json          # Paginate + JSON
+teams search "quarterly" --json                      # JSON output
 ```
 
-### Reactions (multi-ID)
+### Reactions
 
 ```bash
-teams react like 5 6 7 -y              # React to multiple messages
-teams unreact like 5 6 7 -y            # Remove reactions
+teams react 5 like                                   # Add reaction (shows confirmation)
+teams react 5 heart -y                               # Skip confirmation
+teams unreact 5 like                                 # Remove reaction
+teams unreact 5 laugh -y                             # Skip confirmation
 ```
 
 Available reactions: `like`, `heart`, `laugh`, `surprised`, `sad`, `angry`.
-
-### Mark Read / Unread
-
-```bash
-teams mark-read 5 6 7 -y               # Mark messages as read
-teams mark-read 5 --unread -y          # Mark as unread
-```
 
 ### Presence / Status
 
@@ -158,7 +125,7 @@ teams status                                         # Show current presence
 teams set-status Available                           # Set status
 teams set-status Busy -y                             # Skip confirmation
 teams set-status DoNotDisturb --expiry +1h           # With expiry
-teams set-status Offline -y                          # Appear offline
+teams set-status Away --expiry +30m -y               # Expiry + skip confirm
 ```
 
 Available statuses: `Available`, `Busy`, `DoNotDisturb`, `BeRightBack`, `Away`, `Offline`.
@@ -188,14 +155,12 @@ teams attachments 5 -d --save-to ~/Downloads         # Custom download path
 teams attachments 5 --json                           # JSON output
 ```
 
-### Teams & Channels
+### Mark Read
 
 ```bash
-teams teams                                          # List joined teams
-teams teams --offset 5 --json                        # Paginate + JSON
-
-teams channels 1                                     # List channels in team #1
-teams channels 1 --offset 3 --json                   # Paginate + JSON
+teams mark-read 42 43 44                             # Mark messages as read
+teams mark-read --chat 1 2 3 -y                      # Mark chats as read by chat number
+teams mark-read 42 --unread                          # Mark as unread
 ```
 
 ### User Search
@@ -208,30 +173,28 @@ teams user-search "design team" --json               # JSON output
 
 ## JSON / Scripting
 
-All JSON output uses envelope format: `{ok: true, schema_version: "1.0", data: [...]}`.
-When stdout is piped, JSON is output automatically (no `--json` flag needed):
+Rich output goes to stderr, stdout is pure JSON for clean piping:
 
 ```bash
-teams chats | jq '.data[0].topic'
-teams chat 3 | jq '.data[].sender'
-teams search "keyword" | jq '.data | length'
-teams chats | jq '.data[] | select(.unread_count > 0)'
-teams user-search "John" | jq '.data[0].email'
+teams chats --json | jq '.[0].topic'
+teams chat 3 --json | jq '.[].sender'
+teams search "keyword" --json | jq 'length'
+teams chats --json | jq '.[] | select(.unread_count > 0)'
+teams unread --json | jq '.[].display_title'
+teams user-search "John" --json | jq '.[0].email'
 ```
 
 ## ID System
 
-Chats get short display numbers (#1, #2, #3...) and messages get their own global sequence (#1, #2...). Teams use `#1`, `#2` format. Numbers are assigned when listing and persist across commands. ID map is capped at 500 entries per section (LRU eviction).
+Chats get short display numbers (#1, #2, #3...) and messages get their own global sequence (#1, #2...). Numbers are assigned when listing and persist across commands. ID map is capped at 500 entries per section (LRU eviction).
 
 ```bash
 teams chats               # Shows #1, #2, #3...
 teams chat 3              # Read messages from chat #3
 teams chat 3 -n 20        # Messages get #N numbers
 teams read 15             # Read message #15 in detail
-teams react like 15       # React to message #15
-teams reply 15 "Thanks"   # Reply to message #15
-teams edit 15 "Updated"   # Edit message #15
-teams delete 15           # Delete message #15
+teams react 15 like       # React to message #15
+teams reply 15 "Thanks"   # (if available)
 ```
 
 ## Environment Variables
@@ -241,7 +204,6 @@ teams delete 15           # Delete message #15
 | `TEAMS_IC3_TOKEN` | Override IC3 token (skip login) |
 | `TEAMS_REGION` | Override region (default: auto-detected) |
 | `TEAMS_PROXY` | HTTP proxy URL |
-| `TEAMS_TIMEOUT` | HTTP request timeout in seconds (default: 30) |
 | `TEAMS_CLI_CACHE` | Cache directory (default: `~/.cache/teams-cli`) |
 | `TEAMS_CLI_CONFIG` | Config directory (default: `~/.config/teams-cli`) |
 
@@ -257,20 +219,20 @@ teams chat 3 -n 10
 # Find a specific message across all chats
 teams search "deployment failed" -n 5
 
+# Find messages from a person
+teams search "status update" --from "Makbule"
+
 # Send a quick message to someone
 teams send "john.doe@company.com" "Acknowledged, will review today." -y
 
-# Create a group chat for a project
-teams group-chat "Alice" "Bob" --topic "Sprint 42" --message "Kickoff" -y
-
-# Edit a typo in a sent message
-teams edit 42 "Corrected text here" -y
-
-# Forward important info to another chat
-teams forward 42 3 --comment "Please review" -y
+# Reply in a group chat
+teams chat-send 5 "Sounds good, let's proceed." -y
 
 # Share a file in a chat
 teams send-file 3 ./report.pdf -m "Weekly report attached" -y
+
+# Check someone's presence before messaging
+teams status
 
 # Set DND for a meeting
 teams set-status DoNotDisturb --expiry +1h -y
@@ -278,8 +240,14 @@ teams set-status DoNotDisturb --expiry +1h -y
 # Download attachments from a message
 teams attachments 12 -d --save-to ~/Downloads
 
+# Mark chats as read by chat number
+teams mark-read --chat 1 2 3 -y
+
 # Schedule a reminder
 teams schedule 3 "Don't forget: review PR" "+2h" -y
+
+# Search for a document shared in chats
+teams search "Yapay Zeka Kullanım Politikası" --json
 ```
 
 ## Error Handling
@@ -295,8 +263,7 @@ teams schedule 3 "Don't forget: review PR" "+2h" -y
 
 - Tokens are cached with `chmod 600` (owner-only read/write).
 - Browser state saved for SSO — avoids repeated logins.
-- Write commands ask for confirmation by default (use `-y` to skip).
-- `send` refuses `-y` when name match is uncertain — prevents wrong-person sends.
-- Self-messages route to `48:notes` (not to random 1:1 chats).
+- `send`, `chat-send`, `react`, `unreact`, `schedule`, `send-file`, `set-status` ask for confirmation by default (use `-y` to skip).
 - Anti-detection: random jitter between requests (0.3s reads, 2.0s writes), full browser headers.
 - Do not share or log bearer tokens — they grant full Teams access.
+- Prefer `teams login` over manually copying tokens.

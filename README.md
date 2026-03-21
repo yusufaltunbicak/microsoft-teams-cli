@@ -20,9 +20,10 @@ playwright install chromium
 ## Auth
 
 ```sh
-teams login          # opens browser, captures tokens automatically
-teams login --force  # force re-login, ignore saved session
-teams whoami         # verify current user
+teams login              # opens browser, captures tokens automatically
+teams login --force      # force re-login, ignore saved session
+teams login --with-token # read token from stdin (for CI/CD)
+teams whoami             # verify current user
 ```
 
 Token is cached at `~/.cache/teams-cli/tokens.json`. Auto re-login on 401.
@@ -87,6 +88,7 @@ teams delete 42                     # delete (with confirmation)
 teams delete 42 -y                  # delete without confirmation
 teams forward 42 1 --comment "FYI"  # forward message to chat #1
 teams mark-read 42 43 44            # mark multiple as read
+teams mark-read --chat 1 2 3 -y    # mark chats as read by chat number
 teams mark-read 42 --unread         # mark as unread
 ```
 
@@ -101,13 +103,6 @@ teams group-chat "Alice" "Bob" --topic "Project X" --message "Kickoff!" -y
 ```sh
 teams react like 42 43 44 -y       # like/heart/laugh/surprised/sad/angry
 teams unreact like 42 43 44 -y
-```
-
-### Teams & Channels
-
-```sh
-teams teams                         # list your teams
-teams channels 1                    # list channels in team #1
 ```
 
 ### Scheduled Messages
@@ -158,7 +153,6 @@ All JSON output uses a structured envelope:
    - IC3 for chats/messages/group-chats
    - Graph for user search/file uploads
    - Presence for UPS presence read/write
-   - CSA for teams/channels listing
    - Substrate for search
 5. Tokens are cached at `~/.cache/teams-cli/tokens.json`
 6. Messages get short display numbers (#1, #2...) mapped to real Teams IDs

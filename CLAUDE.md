@@ -39,7 +39,7 @@ python -m pytest              # run mocked/unit suite
   - `reactions.py` — `react`, `unreact` (multi-ID)
   - `message_manage.py` — `edit`, `delete`
   - `group_chat.py` — `group-chat`, `forward`
-  - `mark_read.py` — `mark-read` (supports `--unread`)
+  - `mark_read.py` — `mark-read` (supports `--unread`, `--chat`)
   - `schedule.py` — `schedule`, `schedule-list`, `schedule-cancel`, `schedule-run`
   - `presence.py` — `status`, `set-status`
   - `attachments.py` — `attachments`
@@ -69,6 +69,8 @@ python -m pytest              # run mocked/unit suite
 - **Group chat creation**: Uses IC3 `/threads` API with minimal payload `{members, properties: {threadType: "chat"}}`. Topic set separately via `/threads/{id}/properties?name=topic`. Reverse-engineered from Teams web client.
 - **Message edit/delete**: Edit uses IC3 PUT on message, delete uses IC3 DELETE with `{deletetime: unix_ms}`.
 - **Set status**: Uses UPS `PUT /me/forceavailability/` (not Graph `setUserPreferredPresence` which is unreliable). Supports `desiredExpirationTime` for timed status.
+- **Unread detection**: Compares `properties.consumptionhorizon` timestamp (read position) with `lastMessage.composetime`. Skips marking as unread when the last message sender is the current user (prevents false positives for self-sent messages). The `consumptionhorizon` is in the top-level `properties` dict, NOT in `threadProperties`.
+- **Mark chat read**: `mark_chat_read()` sets `consumptionhorizon` to current time on a conversation. `mark-read --chat` flag accepts chat numbers directly (resolves via `_resolve_chat_id`).
 - **Mark unread**: Uses `consumptionHorizonBookmark` property (not `consumptionhorizon`). Reverse-engineered from Teams web client.
 - **Presence fallback**: `get_presence()` tries Graph first, then falls back to Teams UPS using the presence token when Graph `/me/presence` returns 403.
 - **1:1 chat resolution**: `_find_existing_1on1` checks the OTHER party in conv_id (not substring match, which would match own ID in every chat). Self-sends use `48:notes`.
