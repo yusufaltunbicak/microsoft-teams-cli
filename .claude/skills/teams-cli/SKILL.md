@@ -155,18 +155,12 @@ teams attachments 5 -d --save-to ~/Downloads         # Custom download path
 teams attachments 5 --json                           # JSON output
 ```
 
-### Teams & Channels
+### Mark Read
 
 ```bash
-teams teams                                          # List joined teams
-teams teams --json                                   # JSON output
-
-teams channels team_1                                # List channels in team
-teams channels team_1 --json                         # JSON output
-
-teams channel team_1 channel_1_1                     # Read channel messages
-teams channel team_1 channel_1_1 -n 50               # Limit count
-teams channel team_1 channel_1_1 --json              # JSON output
+teams mark-read 42 43 44                             # Mark messages as read
+teams mark-read --chat 1 2 3 -y                      # Mark chats as read by chat number
+teams mark-read 42 --unread                          # Mark as unread
 ```
 
 ### User Search
@@ -192,7 +186,7 @@ teams user-search "John" --json | jq '.[0].email'
 
 ## ID System
 
-Chats get short display numbers (#1, #2, #3...) and messages get their own global sequence (#1, #2...). Teams use `team_1`, `team_2` format; channels use `channel_1_1`, `channel_1_2` format. Numbers are assigned when listing and persist across commands. ID map is capped at 500 entries per section (LRU eviction).
+Chats get short display numbers (#1, #2, #3...) and messages get their own global sequence (#1, #2...). Numbers are assigned when listing and persist across commands. ID map is capped at 500 entries per section (LRU eviction).
 
 ```bash
 teams chats               # Shows #1, #2, #3...
@@ -246,10 +240,8 @@ teams set-status DoNotDisturb --expiry +1h -y
 # Download attachments from a message
 teams attachments 12 -d --save-to ~/Downloads
 
-# Browse team channels
-teams teams
-teams channels team_1
-teams channel team_1 channel_1_1 -n 20
+# Mark chats as read by chat number
+teams mark-read --chat 1 2 3 -y
 
 # Schedule a reminder
 teams schedule 3 "Don't forget: review PR" "+2h" -y
