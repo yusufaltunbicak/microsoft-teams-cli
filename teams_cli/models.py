@@ -279,42 +279,6 @@ class Attachment:
         )
 
 
-@dataclass
-class Team:
-    id: str
-    name: str
-    description: str
-    is_archived: bool = False
-    display_num: int = 0
-
-    @classmethod
-    def from_api(cls, data: dict) -> Team:
-        return cls(
-            id=data.get("id", data.get("teamId", "")),
-            name=data.get("displayName", data.get("name", "")),
-            description=data.get("description", data.get("teamDescription", "") or ""),
-            is_archived=data.get("isArchived", False),
-        )
-
-
-@dataclass
-class Channel:
-    id: str
-    name: str
-    description: str
-    team_id: str = ""
-    display_num: int = 0
-
-    @classmethod
-    def from_api(cls, data: dict, team_id: str = "") -> Channel:
-        return cls(
-            id=data.get("id", data.get("channelId", "")),
-            name=data.get("displayName", data.get("name", "")),
-            description=data.get("description", "") or "",
-            team_id=team_id,
-        )
-
-
 def _parse_unread_count(thread_props: dict) -> int:
     """Extract unread count from thread properties, handling both dict and string formats."""
     ch = thread_props.get("consumptionhorizon")

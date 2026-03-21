@@ -24,7 +24,6 @@ from .anti_detection import BrowserSession
 from .constants import (
     CACHE_DIR,
     CHATSVC_BASE,
-    CSA_BASE,
     GRAPH_BASE,
     ID_MAP_FILE,
     MT_BASE,
@@ -38,7 +37,7 @@ from .exceptions import (
     ResourceNotFoundError,
     TokenExpiredError,
 )
-from .models import Attachment, Channel, Chat, Message, Team, User
+from .models import Attachment, Chat, Message, User
 
 
 class TeamsClient:
@@ -51,7 +50,7 @@ class TeamsClient:
         self._ic3 = tokens.get("ic3", "")
         self._graph = tokens.get("graph", "")
         self._presence_token = tokens.get("presence", "")
-        self._csa_token = tokens.get("csa", "")
+
         self._substrate = tokens.get("substrate", "")
         self._region = tokens.get("region", "emea")
         self._user_id = tokens.get("user_id", "")
@@ -61,8 +60,6 @@ class TeamsClient:
         # Resolve base URLs
         self._chatsvc = CHATSVC_BASE.format(region=self._region)
         self._mt = MT_BASE.format(region=self._region)
-        self._csa = CSA_BASE.format(region=self._region)
-        self._csa_v2 = self._csa.replace("/api/v3", "/api/v2")
         self._ups = UPS_BASE.format(region=self._region)
 
         # Anti-detection session
@@ -662,34 +659,6 @@ class TeamsClient:
 
         return sorted(users, key=score)
 
-    # ------------------------------------------------------------------
-    # Teams & Channels
-    # ------------------------------------------------------------------
-
-    def get_joined_teams(self, skip: int = 0) -> list[Team]:
-        """Get teams the user has joined via Graph API."""
-        params: dict = {}
-        if skip:
-            params["$skip"] = skip
-        resp = self._graph_get("/me/joinedTeams", params=params if params else None)
-        teams_data = resp.get("value", [])
-
-        teams = [Team.from_api(t) for t in teams_data]
-        self._assign_team_nums(teams)
-        return teams
-
-    def get_channels(self, team_num: str, skip: int = 0) -> list[Channel]:
-        """Get channels for a team via Graph API."""
-        team_id = self._resolve_team_id(team_num)
-        resp = self._graph_get(f"/teams/{team_id}/channels")
-        channels_data = resp.get("value", [])
-
-        channels = [Channel.from_api(c, team_id=team_id) for c in channels_data]
-        if skip:
-            channels = channels[skip:]
-        self._assign_channel_nums(channels, team_num)
-        return channels
-
     def get_presence(self) -> dict:
         """Get current presence status, with UPS fallback for tenants that block Graph."""
         try:
@@ -1256,26 +1225,6 @@ class TeamsClient:
             f"Unknown message #{display_id}. Read a chat first to populate the ID map."
         )
 
-    def _resolve_team_id(self, display_id: str) -> str:
-        key = f"team_{display_id}"
-        self._refresh_misc_id_map_entry(key)
-        if key in self._id_map:
-            return self._id_map[key]
-        if len(display_id) > 20:
-            return display_id
-        raise ValueError(
-            f"Unknown team #{display_id}. Run 'teams teams' first."
-        )
-
-    def _resolve_channel_id(self, team_num: str, channel_num: str) -> str:
-        key = f"channel_{team_num}_{channel_num}"
-        self._refresh_misc_id_map_entry(key)
-        if key in self._id_map:
-            return self._id_map[key]
-        raise ValueError(
-            f"Unknown channel #{channel_num} in team #{team_num}. Run 'teams channels {team_num}' first."
-        )
-
     def _assign_chat_nums(self, chats: list[Chat]) -> None:
         def update(id_map: dict) -> None:
             id_map["chats"] = {}
@@ -1356,29 +1305,6 @@ class TeamsClient:
                     msg.chat_title = f"#{num} {title}"
                 else:
                     msg.chat_title = f"Chat #{num}"
-
-    def _assign_team_nums(self, teams: list[Team]) -> None:
-        def update(id_map: dict) -> None:
-            stale_keys = [key for key in id_map if key.startswith("team_")]
-            for key in stale_keys:
-                del id_map[key]
-            for i, team in enumerate(teams, 1):
-                team.display_num = i
-                id_map[f"team_{i}"] = team.id
-
-        self._update_id_map(update)
-
-    def _assign_channel_nums(self, channels: list[Channel], team_num: str) -> None:
-        def update(id_map: dict) -> None:
-            prefix = f"channel_{team_num}_"
-            stale_keys = [key for key in id_map if key.startswith(prefix)]
-            for key in stale_keys:
-                del id_map[key]
-            for i, channel in enumerate(channels, 1):
-                channel.display_num = i
-                id_map[f"channel_{team_num}_{i}"] = channel.id
-
-        self._update_id_map(update)
 
     def _evict_old_entries(self, section: str) -> None:
         self._evict_old_entries_from_map(self._id_map, section)
@@ -1555,22 +1481,6 @@ class TeamsClient:
         headers = self._session.browser_headers(self._ic3)
         url = f"{self._mt}{path}"
         return self._request_with_retry("POST", url, headers, json_data=json_data)
-
-    # ------------------------------------------------------------------
-    # HTTP helpers — CSA (Teams/Channels)
-    # ------------------------------------------------------------------
-
-    def _csa_get(self, path: str, params: dict | None = None) -> dict:
-        self._session.jitter(is_write=False)
-        headers = self._session.browser_headers(self._csa_token or self._ic3)
-        url = f"{self._csa}{path}"
-        return self._request_with_retry("GET", url, headers, params=params)
-
-    def _csa_v2_get(self, path: str, params: dict | None = None) -> dict:
-        self._session.jitter(is_write=False)
-        headers = self._session.browser_headers(self._csa_token or self._ic3)
-        url = f"{self._csa_v2}{path}"
-        return self._request_with_retry("GET", url, headers, params=params)
 
     def _ups_post(self, path: str, json_data: dict | list | None = None):
         self._session.jitter(is_write=False)

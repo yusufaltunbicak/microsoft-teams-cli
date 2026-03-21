@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-from .models import Channel, Chat, Message, Team, User
+from .models import Chat, Message, User
 
 console = Console(stderr=True)
 
@@ -113,44 +113,6 @@ def print_message_detail(msg: Message) -> None:
         console.print("[bold]Attachments:[/bold]")
         for att in msg.attachments:
             console.print(f"  {att.name} ({att.content_type})")
-
-
-def print_teams(teams: list[Team]) -> None:
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
-    table.add_column("#", style="dim", width=5, justify="right")
-    table.add_column("Team", min_width=30)
-    table.add_column("Description", ratio=1, no_wrap=True, overflow="ellipsis")
-
-    for team in teams:
-        style = "dim" if team.is_archived else ""
-        archived = " [dim](archived)[/dim]" if team.is_archived else ""
-        table.add_row(
-            str(team.display_num),
-            f"{team.name}{archived}",
-            _truncate(team.description, 50),
-            style=style,
-        )
-
-    console.print(table)
-
-
-def print_channels(channels: list[Channel], team_name: str = "") -> None:
-    if team_name:
-        console.print(f"[bold cyan]{team_name}[/bold cyan]")
-
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
-    table.add_column("#", style="dim", width=5, justify="right")
-    table.add_column("Channel", min_width=25)
-    table.add_column("Description", ratio=1, no_wrap=True, overflow="ellipsis")
-
-    for ch in channels:
-        table.add_row(
-            str(ch.display_num),
-            ch.name,
-            _truncate(ch.description, 50),
-        )
-
-    console.print(table)
 
 
 def print_users(users: list[User]) -> None:

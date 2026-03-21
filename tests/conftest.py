@@ -25,13 +25,12 @@ import teams_cli.commands.send as cmd_send
 import teams_cli.commands.group_chat as cmd_group_chat
 import teams_cli.commands.mark_read as cmd_mark_read
 import teams_cli.commands.reactions as cmd_reactions
-import teams_cli.commands.teams_channels as cmd_teams
 import teams_cli.constants as constants
 import teams_cli.formatter as formatter
 import teams_cli.scheduler as scheduler
 from teams_cli.client import TeamsClient
 from teams_cli.config import DEFAULTS
-from teams_cli.models import Attachment, Channel, Chat, Message, Reaction, Team, User
+from teams_cli.models import Attachment, Chat, Message, Reaction, User
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -162,7 +161,7 @@ def console_capture(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
     )
     monkeypatch.setattr(formatter, "console", test_console)
     monkeypatch.setattr(commands_common, "console", test_console)
-    for mod in (cmd_auth, cmd_chat, cmd_send, cmd_presence, cmd_schedule, cmd_attachments, cmd_teams, cmd_group_chat, cmd_mark_read, cmd_reactions):
+    for mod in (cmd_auth, cmd_chat, cmd_send, cmd_presence, cmd_schedule, cmd_attachments, cmd_group_chat, cmd_mark_read, cmd_reactions):
         if hasattr(mod, "console"):
             monkeypatch.setattr(mod, "console", test_console)
     monkeypatch.setattr(cli, "console", test_console)
@@ -278,27 +277,3 @@ def make_user():
     return _factory
 
 
-@pytest.fixture
-def make_team():
-    def _factory(
-        team_id: str = "team-1",
-        name: str = "Platform",
-        description: str = "Platform team",
-        is_archived: bool = False,
-    ) -> Team:
-        return Team(id=team_id, name=name, description=description, is_archived=is_archived)
-
-    return _factory
-
-
-@pytest.fixture
-def make_channel():
-    def _factory(
-        channel_id: str = "channel-1",
-        name: str = "General",
-        description: str = "General channel",
-        team_id: str = "team-1",
-    ) -> Channel:
-        return Channel(id=channel_id, name=name, description=description, team_id=team_id)
-
-    return _factory
