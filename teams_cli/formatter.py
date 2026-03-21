@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich import box
 
 try:
     from bs4 import MarkupResemblesLocatorWarning
@@ -17,32 +18,78 @@ from .models import Chat, Message, User
 
 console = Console(stderr=True)
 
+# Chat type icons
+_CHAT_ICONS = {
+    "oneOnOne": "\u2502",   # │ subtle vertical bar for 1:1
+    "group": "\u25cb",      # ○ circle for group
+    "chat": "\u25cb",       # ○ same for generic "chat" type
+    "meeting": "\u25a1",    # □ square for meeting
+}
+
+# Status color mapping
+STATUS_COLORS = {
+    "Available": "green",
+    "Busy": "red",
+    "DoNotDisturb": "red",
+    "BeRightBack": "yellow",
+    "Away": "yellow",
+    "Offline": "dim",
+    "Unknown": "dim",
+}
+
+STATUS_DOTS = {
+    "Available": "[green]\u25cf[/green]",       # ●
+    "Busy": "[red]\u25cf[/red]",
+    "DoNotDisturb": "[red]\u2b24[/red]",         # ⬤
+    "BeRightBack": "[yellow]\u25cf[/yellow]",
+    "Away": "[yellow]\u25cb[/yellow]",           # ○
+    "Offline": "[dim]\u25cb[/dim]",
+    "Unknown": "[dim]?[/dim]",
+}
+
 
 def print_chats(chats: list[Chat]) -> None:
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
-    table.add_column("Chat", width=35, no_wrap=True, overflow="ellipsis")
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.ROUNDED,
+        border_style="dim",
+        pad_edge=True,
+        show_lines=False,
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("", width=1)  # chat type icon
+    table.add_column("Chat", width=30, no_wrap=True, overflow="ellipsis")
     table.add_column("Last Message", ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column("From", width=15, no_wrap=True)
+    table.add_column("From", width=14, no_wrap=True)
     table.add_column("Time", width=9, no_wrap=True, justify="right")
-    table.add_column("", width=2)  # flags
+    table.add_column("", width=3)  # unread badge
 
     for chat in chats:
-        flags = ""
-        if chat.unread_count > 0:
-            flags = f"*{chat.unread_count}" if chat.unread_count > 1 else "*"
+        # Unread badge
+        if chat.unread_count > 1:
+            badge = f"[bold white on blue] {chat.unread_count} [/bold white on blue]"
+        elif chat.unread_count == 1:
+            badge = "[bold cyan]*[/bold cyan]"
+        else:
+            badge = ""
 
-        style = "bold" if chat.unread_count > 0 else ""
-        title = _format_chat_title(chat)
+        row_style = "bold" if chat.unread_count > 0 else ""
+        icon = _CHAT_ICONS.get(chat.chat_type, "\u2502")
+        num = str(chat.display_num) if chat.display_num else ""
+        title = _truncate(chat.display_title, 28)
         preview = _truncate(chat.last_message_preview, 50)
-        sender = _truncate(chat.last_message_sender, 13)
+        sender = _truncate(chat.last_message_sender, 12)
 
         table.add_row(
+            num,
+            f"[dim]{icon}[/dim]",
             title,
             preview,
             sender,
             _format_date(chat.last_message_time),
-            flags,
-            style=style,
+            badge,
+            style=row_style,
         )
 
     console.print(table)
@@ -116,7 +163,13 @@ def print_message_detail(msg: Message) -> None:
 
 
 def print_users(users: list[User]) -> None:
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.ROUNDED,
+        border_style="dim",
+        pad_edge=True,
+    )
     table.add_column("#", style="dim", width=5, justify="right")
     table.add_column("Name", min_width=25)
     table.add_column("Email", min_width=30)
@@ -126,6 +179,22 @@ def print_users(users: list[User]) -> None:
         table.add_row(str(i), user.display_name, user.email, user.user_type)
 
     console.print(table)
+
+
+def print_status(resp: dict) -> None:
+    """Print presence status with colored indicator."""
+    availability = resp.get("availability", "Unknown")
+    activity = resp.get("activity", "")
+    status_msg = resp.get("statusMessage", {}).get("message", {}).get("content", "")
+
+    dot = STATUS_DOTS.get(availability, STATUS_DOTS["Unknown"])
+    color = STATUS_COLORS.get(availability, "dim")
+
+    console.print(f"  {dot} [bold {color}]{availability}[/bold {color}]")
+    if activity and activity != availability:
+        console.print(f"    [dim]Activity:[/dim] {activity}")
+    if status_msg:
+        console.print(f"    [dim]Message:[/dim]  {status_msg}")
 
 
 def print_whoami(data: dict) -> None:

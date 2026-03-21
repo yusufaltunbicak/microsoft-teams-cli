@@ -14,7 +14,9 @@ def test_print_chats_embeds_display_number_in_chat_column(console_capture, make_
     formatter.print_chats([chat])
 
     rendered = console_capture.getvalue()
-    assert "#12 John Smith" in rendered
+    # Display num is now in its own column, chat name in another
+    assert "12" in rendered
+    assert "John Smith" in rendered
 
 
 def test_print_messages_shows_search_chat_title_and_reactions(

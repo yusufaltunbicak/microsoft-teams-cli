@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import click
 
-from ..formatter import console, print_error, print_success
+from ..formatter import console, print_error, print_status, print_success
 from ..serialization import to_json
 from ._common import _get_client, _handle_api_error, _parse_schedule_time, should_json
 
@@ -27,14 +27,7 @@ def status(as_json: bool):
         if should_json(as_json):
             click.echo(to_json(resp))
         else:
-            availability = resp.get("availability", "Unknown")
-            activity = resp.get("activity", "")
-            status_msg = resp.get("statusMessage", {}).get("message", {}).get("content", "")
-            console.print(f"[bold]Status:[/bold] {availability}")
-            if activity and activity != availability:
-                console.print(f"[bold]Activity:[/bold] {activity}")
-            if status_msg:
-                console.print(f"[bold]Message:[/bold] {status_msg}")
+            print_status(resp)
     except Exception as e:
         print_error(f"Could not get presence: {e}")
 

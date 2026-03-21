@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import click
 
-from ..auth import get_tokens, login as do_login
+from ..auth import get_tokens, login as do_login, _decode_exp
 from ..client import TeamsClient
 from ..config import load_config
 from ..exceptions import TokenExpiredError
@@ -20,6 +20,27 @@ cfg = load_config()
 _client_cache: dict[str, TeamsClient] = {}
 
 
+def _check_token_expiry(tokens: dict[str, str]) -> dict[str, str]:
+    """Check if IC3 token is expired and re-login if needed."""
+    import time
+
+    ic3 = tokens.get("ic3", "")
+    if not ic3:
+        return tokens
+
+    exp = _decode_exp(ic3)
+    # 60-second buffer — proactively refresh before actual expiry
+    if time.time() > exp - 60:
+        print_error("Token expiring soon. Re-authenticating...")
+        try:
+            tokens = do_login()
+            print_success("Re-login successful.")
+        except Exception:
+            print_error("Auto re-login failed. Run: teams login --force")
+            sys.exit(1)
+    return tokens
+
+
 def _get_client() -> TeamsClient:
     if "c" not in _client_cache:
         try:
@@ -27,6 +48,7 @@ def _get_client() -> TeamsClient:
         except RuntimeError as e:
             print_error(str(e))
             sys.exit(1)
+        tokens = _check_token_expiry(tokens)
         _client_cache["c"] = TeamsClient(tokens)
     return _client_cache["c"]
 

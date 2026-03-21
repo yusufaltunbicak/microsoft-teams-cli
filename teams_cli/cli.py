@@ -14,11 +14,27 @@ from .commands._common import (  # noqa: F401 — re-exported for tests
 )
 from .formatter import console  # noqa: F401 — re-exported for tests
 
+BANNER = r"""
+ ╔╦╗┌─┐┌─┐┌┬┐┌─┐  ╔═╗╦  ╦
+  ║ ├┤ ├─┤│││└─┐  ║  ║  ║
+  ╩ └─┘┴ ┴┴ ┴└─┘  ╚═╝╩═╝╩
+"""
 
-@click.group()
+
+class TeamsGroup(click.Group):
+    """Custom group that shows ASCII banner in help."""
+
+    def format_help(self, ctx, formatter):
+        console.print(f"[bold cyan]{BANNER}[/bold cyan]", highlight=False)
+        console.print("  [dim]Microsoft Teams from your terminal[/dim]")
+        console.print()
+        super().format_help(ctx, formatter)
+
+
+@click.group(cls=TeamsGroup)
 @click.version_option(package_name="microsoft-teams-cli")
 def cli():
-    """Microsoft Teams CLI - chat, send, and manage Teams from the terminal."""
+    """Chat, send, search, and manage Microsoft Teams — no API keys required."""
     pass
 
 
