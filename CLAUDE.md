@@ -29,7 +29,7 @@ python -m pytest              # run mocked/unit suite
 
 ### Module responsibilities
 
-- **`cli.py`** — Thin entry point. Defines Click group, imports `commands/` package.
+- **`cli.py`** — Entry point with ASCII banner. Custom `TeamsGroup(click.Group)` shows banner on `--help`. Imports `commands/` package.
 - **`commands/`** — Command modules, each with a `register(cli)` function:
   - `_common.py` — Shared helpers: `_get_client`, `_handle_api_error`, `cfg`, `should_json`, `_parse_schedule_time`, `_format_size`, `VALID_REACTIONS`.
   - `auth.py` — `login` (with `--with-token` for CI/CD), `whoami`
@@ -42,13 +42,14 @@ python -m pytest              # run mocked/unit suite
   - `mark_read.py` — `mark-read` (supports `--unread`, `--chat`)
   - `schedule.py` — `schedule`, `schedule-list`, `schedule-cancel`, `schedule-run`
   - `presence.py` — `status`, `set-status`
+  - `summary.py` — `summary` (parallel API dashboard: status + unreads + recent)
   - `attachments.py` — `attachments`
 - **`exceptions.py`** — Structured hierarchy: `TeamsCliError` → `TokenExpiredError`, `RateLimitError`, `ResourceNotFoundError`, `AuthRequiredError`, `ApiError`.
 - **`client.py`** — `TeamsClient` wraps multi-token routing (IC3/Graph/MT/UPS). Two-level ID mapping. HTTP helpers (`_ic3_get`, `_ic3_post`, `_ic3_put`, `_ic3_delete`, `_graph_get`, `_ups_put`, etc.) handle jitter/auth/response parsing.
 - **`auth.py`** — Playwright-based login + `login_with_token()` for CI/CD (stdin). Opens Teams web, extracts MSAL tokens from localStorage via JS evaluation. Classifies by audience (`ic3`, `graph`, `presence`, `csa`, `substrate`). Detects region from GTM localStorage key.
 - **`anti_detection.py`** — `BrowserSession`: request jitter, full browser headers (Sec-Fetch-*, sec-ch-ua-*), proxy support, configurable timeout.
 - **`models.py`** — Dataclasses (User, Chat, Message, Reaction, Attachment) with `from_api()` class methods that normalize various API response formats.
-- **`formatter.py`** — Rich tables output. `Console(stderr=True)` so JSON piping to stdout stays clean.
+- **`formatter.py`** — Rich tables with ROUNDED borders, chat type icons (`│` 1:1, `○` group, `□` meeting), colored unread badges, status dots (`STATUS_DOTS`/`STATUS_COLORS`), `print_status()`. `Console(stderr=True)` so JSON piping to stdout stays clean.
 - **`serialization.py`** — JSON envelope format `{ok, schema_version, data}` with `to_json()` and `to_json_error()`. Auto-JSON when stdout is piped (`is_piped()`).
 - **`scheduler.py`** — Local scheduled message tracking (Teams has no native scheduled send).
 - **`config.py`** — YAML config with deep-merge defaults. Includes `timeout` setting.
@@ -72,7 +73,9 @@ python -m pytest              # run mocked/unit suite
 - **Unread detection**: Compares `properties.consumptionhorizon` timestamp (read position) with `lastMessage.composetime`. Skips marking as unread when the last message sender is the current user (prevents false positives for self-sent messages). The `consumptionhorizon` is in the top-level `properties` dict, NOT in `threadProperties`.
 - **Mark chat read**: `mark_chat_read()` sets `consumptionhorizon` to current time on a conversation. `mark-read --chat` flag accepts chat numbers directly (resolves via `_resolve_chat_id`).
 - **Mark unread**: Uses `consumptionHorizonBookmark` property (not `consumptionhorizon`). Reverse-engineered from Teams web client.
-- **Presence fallback**: `get_presence()` tries Graph first, then falls back to Teams UPS using the presence token when Graph `/me/presence` returns 403.
+- **Token precheck**: `_check_token_expiry()` in `_common.py` parses JWT `exp` claim before creating client. Proactively re-auths with 60-second buffer to avoid 401 round-trips.
+- **Presence fallback**: `get_presence()` tries Graph first, then falls back to Teams UPS using the presence token when Graph `/me/presence` returns 401 or 403.
+- **Summary dashboard**: `teams summary` uses `ThreadPoolExecutor(max_workers=3)` to fetch presence, recent chats, and unread chats in parallel.
 - **1:1 chat resolution**: `_find_existing_1on1` checks the OTHER party in conv_id (not substring match, which would match own ID in every chat). Self-sends use `48:notes`.
 - **Output convention**: Every list command supports `--json` flag. Rich tables go to stderr (`Console(stderr=True)`), JSON goes to stdout via `click.echo()`. Piped stdout auto-triggers JSON envelope.
 - **Send confirmation**: `send`, `chat-send`, `reply`, `react`, `unreact`, `edit`, `delete`, `forward`, `group-chat`, `schedule`, `send-file`, `set-status`, `mark-read` show details and require `-y` to skip.

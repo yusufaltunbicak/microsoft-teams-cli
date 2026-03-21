@@ -4,6 +4,10 @@ Chat, send, and manage Microsoft Teams from the terminal.
 
 Uses MSAL token extraction via Playwright — no Azure app registration, admin consent, or API keys required.
 
+<p align="center">
+  <img src="assets/help.svg" alt="teams --help" width="700">
+</p>
+
 > **Disclaimer**: This is an unofficial, community-driven project. It is **not affiliated with, endorsed by, or supported by Microsoft Corporation**. "Microsoft Teams" and "Microsoft 365" are trademarks of Microsoft Corporation.
 >
 > This tool accesses Microsoft Teams services using intercepted browser tokens and undocumented internal APIs (IC3 Chat Service, UPS Presence). **Use of this tool may violate [Microsoft's Terms of Service](https://www.microsoft.com/en-us/servicesagreement)** or your organization's acceptable use policies. The authors accept no responsibility for account suspensions, data loss, or other consequences arising from the use of this tool.
@@ -31,6 +35,19 @@ You can also set `TEAMS_IC3_TOKEN` env var directly.
 
 ## Usage
 
+### Summary Dashboard
+
+Quick overview of your status, unread chats, and recent activity — all in one command with parallel API calls.
+
+```sh
+teams summary              # status + unreads + recent activity
+teams summary --json       # JSON output
+```
+
+<p align="center">
+  <img src="assets/summary.svg" alt="teams summary" width="600">
+</p>
+
 ### Chats
 
 ```sh
@@ -45,6 +62,14 @@ teams chat 1 --before 2026-03-15   # before date
 teams unread                       # list unread chats with message preview
 ```
 
+<p align="center">
+  <img src="assets/chats.svg" alt="teams chats" width="700">
+</p>
+
+<p align="center">
+  <img src="assets/chat_messages.svg" alt="teams chat 2" width="700">
+</p>
+
 ### Read / Search
 
 ```sh
@@ -55,6 +80,10 @@ teams search "keyword" --max 10 --from "John" --after 2026-03-01
 teams search "keyword" --chat 1    # search within a specific chat
 teams user-search "john"           # find users by name or email
 ```
+
+<p align="center">
+  <img src="assets/search.svg" alt="teams search" width="700">
+</p>
 
 ### Send / Reply
 
@@ -69,6 +98,10 @@ teams chat-send 1 "Meeting at 3pm" -y      # skip confirmation
 teams reply 42 "On it."                    # reply to message #42
 teams reply 42 "Sounds good" -y            # reply, skip confirmation
 ```
+
+<p align="center">
+  <img src="assets/send.svg" alt="teams send" width="600">
+</p>
 
 ### Files
 
@@ -128,6 +161,10 @@ teams set-status DoNotDisturb --expiry +2h -y
 ```
 
 Available statuses: `Available`, `Busy`, `DoNotDisturb`, `BeRightBack`, `Away`, `Offline`.
+
+<p align="center">
+  <img src="assets/status.svg" alt="teams status" width="500">
+</p>
 
 ## JSON Output
 
