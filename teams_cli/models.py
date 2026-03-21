@@ -63,7 +63,7 @@ class Chat:
     display_num: int = 0
 
     @classmethod
-    def from_api(cls, data: dict) -> Chat:
+    def from_api(cls, data: dict, my_user_id: str = "") -> Chat:
         # IC3 chat service format
         thread_props = data.get("threadProperties", {})
         props = data.get("properties", {})
@@ -105,7 +105,10 @@ class Chat:
             last_message_time=last_time,
             last_message_sender=last_sender,
             members=members,
-            unread_count=_parse_unread_count(thread_props, props, last_time),
+            unread_count=_parse_unread_count(
+                thread_props, props, last_time,
+                last_msg.get("from", ""), my_user_id,
+            ),
         )
 
     @classmethod
@@ -284,6 +287,8 @@ def _parse_unread_count(
     thread_props: dict,
     props: dict | None = None,
     last_msg_time: datetime | None = None,
+    last_sender_mri: str = "",
+    my_user_id: str = "",
 ) -> int:
     """Extract unread count from thread properties, handling both dict and string formats."""
     ch = thread_props.get("consumptionhorizon")
@@ -301,6 +306,9 @@ def _parse_unread_count(
         pass
     # Check properties.consumptionhorizon (string format: "read_ts;delivered_ts;msg_id")
     if props and last_msg_time:
+        # If the last message is from the current user, they've seen it
+        if my_user_id and my_user_id in last_sender_mri:
+            return 0
         ch_str = props.get("consumptionhorizon", "")
         if ch_str:
             try:
