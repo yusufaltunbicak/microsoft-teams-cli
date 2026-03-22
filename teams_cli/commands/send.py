@@ -87,8 +87,8 @@ def send(user_query: str, message: str, yes: bool, html: bool):
         target = candidates[choice - 1]
 
     # Safety: even with -y, if the best match doesn't contain all query words, warn
-    target_name_lower = target.display_name.lower()
-    if not all(w in target_name_lower for w in query_words):
+    target_searchable = target.display_name.lower() + " " + target.email.lower()
+    if not all(w in target_searchable for w in query_words):
         print_error(f"No exact match for '{user_query}'. Best match: {target.display_name} ({target.email})")
         if yes:
             print_error("Refusing to send with -y when match is uncertain. Remove -y to select manually.")
