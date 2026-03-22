@@ -20,12 +20,13 @@ python -m pytest              # run mocked/unit suite
 
 ## Architecture
 
-### Five API layers
+### Six API layers
 
 1. **IC3 Chat Service** (`teams.cloud.microsoft/api/chatsvc/{region}/v1/`) — primary API for chats, messages, conversations, group chat creation, message edit/delete. Uses IC3 bearer token (aud: `ic3.teams.office.com`).
 2. **Substrate Search** (`substrate.office.com/searchservice/api/v2/query`) — primary search API. Uses Substrate token (aud: `substrate.office.com`). Falls back to scanning recent chats if no substrate token.
-3. **Graph API** (`graph.microsoft.com/v1.0/`) — user search, file uploads, 1:1 chat creation. Uses Graph token when available, IC3 fallback.
+3. **Graph API** (`graph.microsoft.com/v1.0/`) — user search, file uploads, 1:1 chat creation, calendar/meetings, OneDrive file listing. Uses Graph token when available, IC3 fallback.
 4. **UPS Presence** (`teams.cloud.microsoft/ups/{region}/v1/`) — presence read (`getpresence`) and write (`forceavailability`). Used for both get and set status (Graph presence endpoints are unreliable).
+5. **SharePoint Media API** (`{tenant}-my.sharepoint.com/_api/v2.1/drives/{driveId}/items/{itemId}/media/transcripts`) — transcript access for meeting recordings stored in OneDrive. Uses Playwright headless browser with saved SSO cookies (not bearer tokens). See "SharePoint transcript caveats" below.
 
 ### Module responsibilities
 
@@ -44,11 +45,12 @@ python -m pytest              # run mocked/unit suite
   - `presence.py` — `status`, `set-status`
   - `summary.py` — `summary` (parallel API dashboard: status + unreads + recent)
   - `attachments.py` — `attachments`
+  - `meetings.py` — `meetings`, `recordings`, `transcripts`
 - **`exceptions.py`** — Structured hierarchy: `TeamsCliError` → `TokenExpiredError`, `RateLimitError`, `ResourceNotFoundError`, `AuthRequiredError`, `ApiError`.
-- **`client.py`** — `TeamsClient` wraps multi-token routing (IC3/Graph/MT/UPS). Two-level ID mapping. HTTP helpers (`_ic3_get`, `_ic3_post`, `_ic3_put`, `_ic3_delete`, `_graph_get`, `_ups_put`, etc.) handle jitter/auth/response parsing.
+- **`client.py`** — `TeamsClient` wraps multi-token routing (IC3/Graph/MT/UPS/SharePoint). Three-level ID mapping (chats, messages, meetings). HTTP helpers (`_ic3_get`, `_ic3_post`, `_ic3_put`, `_ic3_delete`, `_graph_get`, `_ups_put`, etc.) handle jitter/auth/response parsing.
 - **`auth.py`** — Playwright-based login + `login_with_token()` for CI/CD (stdin). Opens Teams web, extracts MSAL tokens from localStorage via JS evaluation. Classifies by audience (`ic3`, `graph`, `presence`, `csa`, `substrate`). Detects region from GTM localStorage key.
 - **`anti_detection.py`** — `BrowserSession`: request jitter, full browser headers (Sec-Fetch-*, sec-ch-ua-*), proxy support, configurable timeout.
-- **`models.py`** — Dataclasses (User, Chat, Message, Reaction, Attachment) with `from_api()` class methods that normalize various API response formats.
+- **`models.py`** — Dataclasses (User, Chat, Message, Reaction, Attachment, Meeting, Recording, Transcript) with `from_api()` class methods that normalize various API response formats.
 - **`formatter.py`** — Rich tables with ROUNDED borders, chat type icons (`│` 1:1, `○` group, `□` meeting), colored unread badges, status dots (`STATUS_DOTS`/`STATUS_COLORS`), `print_status()`. `Console(stderr=True)` so JSON piping to stdout stays clean.
 - **`serialization.py`** — JSON envelope format `{ok, schema_version, data}` with `to_json()` and `to_json_error()`. Auto-JSON when stdout is piped (`is_piped()`).
 - **`scheduler.py`** — Local scheduled message tracking (Teams has no native scheduled send).
@@ -57,7 +59,7 @@ python -m pytest              # run mocked/unit suite
 
 ### Key patterns
 
-- **Two-level ID mapping**: Chats get `#1, #2...`, messages also get `#1, #2...` (globally, not per-chat). Stored in `id_map.json` with `chats` and `messages` sections. Max 500 entries per section (LRU eviction).
+- **Three-level ID mapping**: Chats get `#1, #2...`, messages get `#1, #2...` (globally, not per-chat), meetings get `#1, #2...`. Stored in `id_map.json` with `chats`, `messages`, and `meetings` sections. Max 500 entries per section (LRU eviction).
 - **Token routing**: `_ic3_get`/`_ic3_post`/`_ic3_put`/`_ic3_delete` for chat service, `_graph_get`/`_graph_post` for Graph, `_ups_post`/`_ups_put` for presence. All HTTP methods go through `_request_with_retry` which handles 429 rate limiting with automatic exponential backoff (up to 3 retries).
 - **Multi-token auth**: MSAL stores multiple tokens in localStorage. We extract `ic3`, `graph`, `presence`, `csa`, `substrate` by audience and keep polling briefly after IC3 appears so secondary tokens are cached too. Token flow: env var `TEAMS_IC3_TOKEN` → cached `tokens.json` → `--with-token` stdin → Playwright login.
 - **Non-interactive login**: `teams login --with-token` reads from stdin (plain IC3 token or JSON bundle). Supports `--region` flag. For CI/CD, cron jobs, and automation pipelines.
@@ -80,6 +82,19 @@ python -m pytest              # run mocked/unit suite
 - **Output convention**: Every list command supports `--json` flag. Rich tables go to stderr (`Console(stderr=True)`), JSON goes to stdout via `click.echo()`. Piped stdout auto-triggers JSON envelope.
 - **Send confirmation**: `send`, `chat-send`, `reply`, `react`, `unreact`, `edit`, `delete`, `forward`, `group-chat`, `schedule`, `send-file`, `set-status`, `mark-read` show details and require `-y` to skip.
 - **Anti-detection**: `BrowserSession.jitter()` adds random delay (0.3s reads, 2.0s writes). `browser_headers()` adds Sec-Fetch-*, sec-ch-ua-* headers.
+- **Meetings & calendar**: `get_meetings()` uses Graph `/me/calendarView`, filters to `isOnlineMeeting` events. Meetings get their own ID map section (`meetings`). `_resolve_meeting_id()` looks up by display number.
+- **Transcript fallback chain**: `get_transcripts()` tries: (1) Graph `onlineMeetings/{id}/transcripts` (requires OnlineMeetings.Read scope — usually unavailable with SPA tokens), (2) SharePoint `media/transcripts` API via Playwright cookies on the recording's drive item, (3) OneDrive file search in `/Recordings/` folder matching by subject + date.
+- **SharePoint cookie auth**: SharePoint APIs don't accept MSAL bearer tokens from Teams localStorage. Instead, `_sharepoint_api_call()` launches a headless Playwright Chromium with saved `browser-state.json` cookies, navigates to the SharePoint host to establish session cookies, then uses `page.evaluate(fetch(..., {credentials: 'include'}))` to call the API with the page's cookie context.
+- **Transcript content safety**: `get_transcript_content()` validates responses are actually text (not video). Checks content-type, file size (10MB limit), and MP4 magic bytes before returning.
+
+### SharePoint transcript caveats
+
+- **Requires Playwright + browser state**: The SharePoint transcript path only works after `teams login` has been run (which saves `browser-state.json`). Cookie sessions expire — re-run `teams login` if transcripts stop working.
+- **Headless Chromium per call**: Each `_sharepoint_api_call()` launches a headless Chromium instance. This adds ~3-5 seconds per transcript operation. Not suitable for high-throughput batch processing.
+- **SharePoint host derivation**: Uses Graph API `/me/drive/root` webUrl to find the correct SharePoint hostname (e.g. `mysunlighten-my.sharepoint.com`). UPN-based derivation is unreliable (org prefixes vary).
+- **No OnlineMeetings.Read scope**: The Teams web SPA token doesn't include `OnlineMeetings.Read`, so the Graph onlineMeetings API typically returns 400/403. The SharePoint fallback is the primary working path.
+- **Transcript format**: SharePoint returns VTT (WebVTT) format. No speaker attribution is included in the VTT from this API.
+- **Recording linkage**: Transcripts are accessed via the recording's OneDrive item ID. The flow is: find recording in OneDrive → get its drive item ID → call `media/transcripts` on that item.
 
 ### Cache & config locations
 

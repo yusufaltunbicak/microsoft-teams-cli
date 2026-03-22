@@ -283,6 +283,105 @@ class Attachment:
         )
 
 
+@dataclass
+class Meeting:
+    id: str
+    subject: str
+    start_time: datetime
+    end_time: datetime
+    organizer: str
+    organizer_email: str
+    attendees: list[str] = field(default_factory=list)
+    join_url: str = ""
+    location: str = ""
+    is_online: bool = True
+    display_num: int = 0
+
+    @classmethod
+    def from_graph_event(cls, data: dict) -> Meeting:
+        """Parse from Graph API /me/calendarView event format."""
+        organizer = data.get("organizer", {}).get("emailAddress", {})
+        attendee_list = data.get("attendees", [])
+        attendees = [
+            a.get("emailAddress", {}).get("name", a.get("emailAddress", {}).get("address", ""))
+            for a in attendee_list
+        ]
+        online = data.get("onlineMeeting", {}) or {}
+        location = data.get("location", {}).get("displayName", "")
+
+        return cls(
+            id=data.get("id", ""),
+            subject=data.get("subject", "(No subject)"),
+            start_time=_parse_dt(data.get("start", {}).get("dateTime", "")),
+            end_time=_parse_dt(data.get("end", {}).get("dateTime", "")),
+            organizer=organizer.get("name", ""),
+            organizer_email=organizer.get("address", ""),
+            attendees=attendees,
+            join_url=online.get("joinUrl", ""),
+            location=location,
+            is_online=data.get("isOnlineMeeting", False),
+        )
+
+
+@dataclass
+class Recording:
+    id: str
+    created_time: datetime
+    recording_content_url: str = ""
+    name: str = ""
+    size: int = 0
+    download_url: str = ""
+
+    @classmethod
+    def from_api(cls, data: dict) -> Recording:
+        return cls(
+            id=data.get("id", ""),
+            created_time=_parse_dt(data.get("createdDateTime", "")),
+            recording_content_url=data.get("recordingContentUrl", ""),
+        )
+
+    @classmethod
+    def from_drive_item(cls, data: dict) -> Recording:
+        """Parse from OneDrive /drive/items response."""
+        return cls(
+            id=data.get("id", ""),
+            created_time=_parse_dt(data.get("createdDateTime", "")),
+            name=data.get("name", ""),
+            size=int(data.get("size", 0)),
+            download_url=data.get("@microsoft.graph.downloadUrl", ""),
+        )
+
+
+@dataclass
+class Transcript:
+    id: str
+    created_time: datetime
+    content_url: str = ""
+    name: str = ""
+    size: int = 0
+    download_url: str = ""
+    _recording_item_id: str = ""
+
+    @classmethod
+    def from_api(cls, data: dict) -> Transcript:
+        return cls(
+            id=data.get("id", ""),
+            created_time=_parse_dt(data.get("createdDateTime", "")),
+            content_url=data.get("transcriptContentUrl", ""),
+        )
+
+    @classmethod
+    def from_drive_item(cls, data: dict) -> Transcript:
+        """Parse from OneDrive /drive/items response."""
+        return cls(
+            id=data.get("id", ""),
+            created_time=_parse_dt(data.get("createdDateTime", "")),
+            name=data.get("name", ""),
+            size=int(data.get("size", 0)),
+            download_url=data.get("@microsoft.graph.downloadUrl", ""),
+        )
+
+
 def _parse_unread_count(
     thread_props: dict,
     props: dict | None = None,

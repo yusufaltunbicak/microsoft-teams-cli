@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass
 
-from .models import Chat, Message, User
+from .models import Chat, Meeting, Message, Recording, Transcript, User
 
 console = Console(stderr=True)
 
@@ -162,6 +162,108 @@ def print_message_detail(msg: Message) -> None:
             console.print(f"  {att.name} ({att.content_type})")
 
 
+def print_meetings(meetings: list[Meeting]) -> None:
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.ROUNDED,
+        border_style="dim",
+        pad_edge=True,
+        show_lines=False,
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Subject", min_width=25, no_wrap=True, overflow="ellipsis")
+    table.add_column("Organizer", width=18, no_wrap=True)
+    table.add_column("Start", width=16, no_wrap=True)
+    table.add_column("End", width=7, no_wrap=True)
+    table.add_column("Attendees", width=5, justify="right")
+
+    for m in meetings:
+        num = str(m.display_num) if m.display_num else ""
+        subject = _truncate(m.subject, 35)
+        organizer = _truncate(m.organizer, 16)
+        start = _format_meeting_time(m.start_time)
+        end = _format_meeting_end(m.start_time, m.end_time)
+        att_count = str(len(m.attendees)) if m.attendees else ""
+
+        table.add_row(num, subject, organizer, start, end, att_count)
+
+    console.print(table)
+
+
+def print_meeting_detail(meeting: Meeting) -> None:
+    header = f"[bold]Subject:[/bold] {meeting.subject}"
+    header += f"\n[bold]Organizer:[/bold] {meeting.organizer}"
+    if meeting.organizer_email:
+        header += f" <{meeting.organizer_email}>"
+    start_local = meeting.start_time.astimezone(datetime.now().astimezone().tzinfo)
+    end_local = meeting.end_time.astimezone(datetime.now().astimezone().tzinfo)
+    header += f"\n[bold]Start:[/bold] {start_local.strftime('%Y-%m-%d %H:%M')}"
+    header += f"\n[bold]End:[/bold] {end_local.strftime('%Y-%m-%d %H:%M')}"
+    if meeting.location:
+        header += f"\n[bold]Location:[/bold] {meeting.location}"
+    if meeting.join_url:
+        header += f"\n[bold]Join URL:[/bold] {meeting.join_url}"
+
+    console.print(Panel(header, title=f"Meeting #{meeting.display_num}", border_style="cyan"))
+
+    if meeting.attendees:
+        console.print()
+        console.print(f"[bold]Attendees ({len(meeting.attendees)}):[/bold]")
+        for a in meeting.attendees:
+            console.print(f"  {a}")
+
+
+def print_recordings(recordings: list[Recording]) -> None:
+    has_names = any(r.name for r in recordings)
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.ROUNDED,
+        border_style="dim",
+        pad_edge=True,
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    if has_names:
+        table.add_column("Name", min_width=30, no_wrap=True, overflow="ellipsis")
+        table.add_column("Size", width=10, justify="right")
+    table.add_column("Created", min_width=16)
+
+    for i, rec in enumerate(recordings, 1):
+        created = _format_meeting_time(rec.created_time)
+        if has_names:
+            table.add_row(str(i), _truncate(rec.name, 40), _format_file_size(rec.size), created)
+        else:
+            table.add_row(str(i), created)
+
+    console.print(table)
+
+
+def print_transcripts(transcripts: list[Transcript]) -> None:
+    has_names = any(t.name for t in transcripts)
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        box=box.ROUNDED,
+        border_style="dim",
+        pad_edge=True,
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    if has_names:
+        table.add_column("Name", min_width=30, no_wrap=True, overflow="ellipsis")
+        table.add_column("Size", width=10, justify="right")
+    table.add_column("Created", min_width=16)
+
+    for i, tr in enumerate(transcripts, 1):
+        created = _format_meeting_time(tr.created_time)
+        if has_names:
+            table.add_row(str(i), _truncate(tr.name, 40), _format_file_size(tr.size), created)
+        else:
+            table.add_row(str(i), created)
+
+    console.print(table)
+
+
 def print_users(users: list[User]) -> None:
     table = Table(
         show_header=True,
@@ -245,6 +347,48 @@ def _format_date(dt: datetime) -> str:
     if dt_local.year == now_local.year:
         return dt_local.strftime("%d %b")
     return dt_local.strftime("%d %b %y")
+
+
+def _format_meeting_time(dt: datetime) -> str:
+    if dt.year == 1:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_local = dt.astimezone(datetime.now().astimezone().tzinfo)
+    now_local = datetime.now().astimezone()
+    if dt_local.date() == now_local.date():
+        return f"Today {dt_local.strftime('%H:%M')}"
+    if (dt_local.date() - now_local.date()).days == 1:
+        return f"Tomorrow {dt_local.strftime('%H:%M')}"
+    if (now_local.date() - dt_local.date()).days == 1:
+        return f"Yesterday {dt_local.strftime('%H:%M')}"
+    return dt_local.strftime("%d %b %H:%M")
+
+
+def _format_meeting_end(start: datetime, end: datetime) -> str:
+    if end.year == 1:
+        return ""
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    start_local = start.astimezone(datetime.now().astimezone().tzinfo)
+    end_local = end.astimezone(datetime.now().astimezone().tzinfo)
+    if start_local.date() == end_local.date():
+        return end_local.strftime("%H:%M")
+    return end_local.strftime("%d %b %H:%M")
+
+
+def _format_file_size(size_bytes: int) -> str:
+    if not size_bytes:
+        return ""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
 def _format_chat_title(chat: Chat) -> str:
