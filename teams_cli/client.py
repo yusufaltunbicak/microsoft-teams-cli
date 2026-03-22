@@ -280,7 +280,8 @@ class TeamsClient:
         client_msg_id = self._make_client_message_id()
 
         if html and not content.startswith("<"):
-            content = f"<p>{content}</p>"
+            paragraphs = [f"<p>{p}</p>" for p in content.split("\n") if p.strip()]
+            content = "".join(paragraphs) or "<p></p>"
 
         payload = {
             "id": "-1",
@@ -450,7 +451,8 @@ class TeamsClient:
 
     def _build_reply_html(self, message: Message, content: str, html: bool = True) -> str:
         if html and not content.startswith("<"):
-            content = f"<p>{content}</p>"
+            paragraphs = [f"<p>{p}</p>" for p in content.split("\n") if p.strip()]
+            content = "".join(paragraphs) or "<p></p>"
 
         msg_id = escape(str(message.id))
         sender_mri = escape(self._reply_sender_mri(message.sender_id))
@@ -605,8 +607,10 @@ class TeamsClient:
                 pass
 
         # Name query — use /me/people
+        # People API doesn't accept email addresses; extract name part
+        people_query = query.split("@")[0].replace(".", " ") if "@" in query else query
         resp = self._graph_get("/me/people", params={
-            "$search": query,
+            "$search": people_query,
             "$top": top,
         })
 
