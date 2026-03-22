@@ -129,6 +129,7 @@ def test_read_id_map_and_lock_cover_corrupt_files_and_missing_fcntl(
     assert teams_client._normalize_id_map({"messages": {"1": {"msg": "a"}}}) == {
         "messages": {"1": {"msg": "a"}},
         "chats": {},
+        "meetings": {},
     }
 
     monkeypatch.setattr("teams_cli.client.fcntl", None)

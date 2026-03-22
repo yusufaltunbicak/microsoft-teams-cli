@@ -25,6 +25,7 @@ from .constants import (
     CACHE_DIR,
     CHATSVC_BASE,
     GRAPH_BASE,
+    GRAPH_BETA_BASE,
     ID_MAP_FILE,
     MT_BASE,
     SUBSTRATE_SEARCH_BASE,
@@ -70,12 +71,14 @@ class TeamsClient:
         # Cache for user display name lookups (user_id -> display_name)
         self._user_name_cache: dict[str, str] = {}
 
-        # ID mapping: two-level (chats and messages)
+        # ID mapping: three-level (chats, messages, meetings)
         self._id_map: dict = self._load_id_map()
         if "chats" not in self._id_map:
             self._id_map["chats"] = {}
         if "messages" not in self._id_map:
             self._id_map["messages"] = {}
+        if "meetings" not in self._id_map:
+            self._id_map["meetings"] = {}
         self._next_chat_num = max(
             (int(k) for k in self._id_map["chats"] if k.isdigit()), default=0
         ) + 1
@@ -690,6 +693,378 @@ class TeamsClient:
         }
 
     # ------------------------------------------------------------------
+    # Meetings, recordings, transcripts
+    # ------------------------------------------------------------------
+
+    def get_meetings(
+        self, start_dt: str, end_dt: str, limit: int = 20,
+    ) -> list:
+        """Fetch calendar events that are Teams online meetings."""
+        from .models import Meeting
+
+        params = {
+            "startDateTime": start_dt,
+            "endDateTime": end_dt,
+            "$top": str(limit),
+            "$select": "id,subject,start,end,organizer,attendees,isOnlineMeeting,onlineMeeting,location",
+            "$orderby": "start/dateTime",
+        }
+        resp = self._graph_get("/me/calendarView", params=params)
+        events = resp.get("value", [])
+        meetings = [
+            Meeting.from_graph_event(e)
+            for e in events
+            if e.get("isOnlineMeeting")
+        ]
+        self._assign_meeting_nums(meetings)
+        return meetings
+
+    def _resolve_online_meeting_id(self, join_url: str) -> str:
+        """Resolve a Teams join URL to an onlineMeeting ID."""
+        params = {"$filter": f"JoinWebUrl eq '{join_url}'"}
+        try:
+            resp = self._graph_get("/me/onlineMeetings", params=params)
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 403:
+                raise ValueError(
+                    "Insufficient permissions for online meetings API. "
+                    "Your Graph token may not include the OnlineMeetings.Read scope."
+                ) from None
+            raise
+        items = resp.get("value", [])
+        if not items:
+            raise ValueError(
+                "No online meeting found for this event. "
+                "Recordings and transcripts are only accessible for meetings you organized."
+            )
+        return items[0]["id"]
+
+    def get_recordings(self, meeting_num: str) -> list:
+        """List recordings for a meeting by display number."""
+        from .models import Recording
+
+        meeting_info = self._resolve_meeting_id(meeting_num)
+        join_url = meeting_info.get("join_url", "")
+
+        # Try Graph onlineMeetings API first
+        if join_url:
+            try:
+                online_id = self._resolve_online_meeting_id(join_url)
+                resp = self._graph_get(f"/me/onlineMeetings/{online_id}/recordings")
+                return [Recording.from_api(r) for r in resp.get("value", [])]
+            except ValueError:
+                pass
+
+        # Fallback: search OneDrive Recordings folder by meeting subject/date
+        subject = meeting_info.get("subject", "")
+        start = meeting_info.get("start_time", "")
+        return self._search_onedrive_recordings(subject, start)
+
+    def get_transcripts(self, meeting_num: str) -> list:
+        """List transcripts for a meeting by display number."""
+        from .models import Transcript
+
+        meeting_info = self._resolve_meeting_id(meeting_num)
+        join_url = meeting_info.get("join_url", "")
+
+        # Try Graph onlineMeetings API first
+        if join_url:
+            try:
+                online_id = self._resolve_online_meeting_id(join_url)
+                resp = self._graph_get(f"/me/onlineMeetings/{online_id}/transcripts")
+                return [Transcript.from_api(t) for t in resp.get("value", [])]
+            except ValueError:
+                pass
+
+        # Fallback: SharePoint media/transcripts API on the recording item
+        sp_transcripts = self._get_sharepoint_transcripts(meeting_info)
+        if sp_transcripts:
+            return sp_transcripts
+
+        # Final fallback: search OneDrive Recordings folder for transcript files
+        subject = meeting_info.get("subject", "")
+        start = meeting_info.get("start_time", "")
+        return self._search_onedrive_transcripts(subject, start)
+
+    def _get_sharepoint_transcripts(self, meeting_info: dict) -> list:
+        """Get transcripts via SharePoint media/transcripts API using Playwright cookies."""
+        from .models import Transcript
+
+        subject = meeting_info.get("subject", "")
+        start = meeting_info.get("start_time", "")
+        recordings = self._search_onedrive_recordings(subject, start)
+        if not recordings:
+            return []
+
+        recording_id = recordings[0].id
+        sp_host = self._derive_sharepoint_host()
+        if not sp_host:
+            return []
+
+        try:
+            drive_id = self._get_onedrive_drive_id()
+            sp_url = f"https://{sp_host}"
+            api_path = f"/_api/v2.1/drives/{drive_id}/items/{recording_id}/media/transcripts"
+            data = self._sharepoint_api_call(sp_url, api_path)
+            if not data:
+                return []
+            return [
+                Transcript(
+                    id=t["id"],
+                    name=t.get("displayName", ""),
+                    content_url=t.get("temporaryDownloadUrl", ""),
+                    created_time=t.get("createdDateTime", ""),
+                    _recording_item_id=recording_id,
+                )
+                for t in data.get("value", [])
+            ]
+        except Exception:
+            return []
+
+    def _derive_sharepoint_host(self) -> str:
+        """Derive SharePoint host from OneDrive root webUrl via Graph API."""
+        try:
+            resp = self._graph_get("/me/drive/root", params={"$select": "webUrl"})
+            web_url = resp.get("webUrl", "")
+            if web_url:
+                # webUrl like "https://mysunlighten-my.sharepoint.com/personal/..."
+                from urllib.parse import urlparse
+                return urlparse(web_url).hostname or ""
+        except Exception:
+            pass
+        return ""
+
+    def _get_onedrive_drive_id(self) -> str:
+        """Get the user's OneDrive drive ID via Graph API."""
+        resp = self._graph_get("/me/drive", params={"$select": "id"})
+        return resp.get("id", "")
+
+    def _sharepoint_api_call(self, sp_url: str, api_path: str) -> dict | None:
+        """Make an API call to SharePoint using Playwright headless with saved cookies."""
+        from .constants import BROWSER_STATE_FILE
+        if not BROWSER_STATE_FILE.exists():
+            return None
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return None
+
+        result = None
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                storage_state=str(BROWSER_STATE_FILE),
+            )
+            page = context.new_page()
+            try:
+                page.goto(sp_url, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)  # Let SSO cookies settle
+
+                # Use page context (cookies) to call the API
+                full_url = f"{sp_url}{api_path}"
+                js_result = page.evaluate(f"""async () => {{
+                    try {{
+                        const resp = await fetch('{full_url}', {{credentials: 'include'}});
+                        if (!resp.ok) return null;
+                        return await resp.json();
+                    }} catch(e) {{
+                        return null;
+                    }}
+                }}""")
+                result = js_result
+            except Exception:
+                pass
+            finally:
+                try:
+                    context.storage_state(path=str(BROWSER_STATE_FILE))
+                except Exception:
+                    pass
+                browser.close()
+
+        return result
+
+    def _get_sharepoint_transcript_content(
+        self, meeting_info: dict, transcript_id: str,
+    ) -> str | None:
+        """Download transcript content via SharePoint media/transcripts API."""
+        subject = meeting_info.get("subject", "")
+        start = meeting_info.get("start_time", "")
+        recordings = self._search_onedrive_recordings(subject, start)
+        if not recordings:
+            return None
+
+        recording_id = recordings[0].id
+        sp_host = self._derive_sharepoint_host()
+        if not sp_host:
+            return None
+
+        try:
+            drive_id = self._get_onedrive_drive_id()
+            sp_url = f"https://{sp_host}"
+            api_path = f"/_api/v2.1/drives/{drive_id}/items/{recording_id}/media/transcripts"
+            data = self._sharepoint_api_call(sp_url, api_path)
+            if not data:
+                return None
+            transcripts = data.get("value", [])
+
+            target = None
+            for t in transcripts:
+                if t.get("id") == transcript_id:
+                    target = t
+                    break
+            if not target and transcripts:
+                target = transcripts[0]
+            if not target:
+                return None
+
+            dl_url = target.get("temporaryDownloadUrl", "")
+            if not dl_url:
+                return None
+
+            # Download the VTT content using the temporary URL (no auth needed)
+            resp = self._session.client.request("GET", dl_url, headers={"User-Agent": USER_AGENT})
+            if resp.status_code != 200:
+                return None
+            return resp.text
+        except Exception:
+            return None
+
+    def _search_onedrive_recordings(self, subject: str, start_time: str) -> list:
+        """Search OneDrive Recordings folder for recording files matching a meeting."""
+        from .models import Recording
+        items = self._list_onedrive_recordings_folder()
+        return [
+            Recording.from_drive_item(item) for item in items
+            if "Meeting Recording" in item.get("name", "")
+            and self._onedrive_file_matches_meeting(item, subject, start_time)
+        ]
+
+    def _search_onedrive_transcripts(self, subject: str, start_time: str) -> list:
+        """Search OneDrive Recordings folder for transcript files matching a meeting."""
+        from .models import Transcript
+        items = self._list_onedrive_recordings_folder()
+        return [
+            Transcript.from_drive_item(item) for item in items
+            if "Meeting Transcript" in item.get("name", "")
+            and self._onedrive_file_matches_meeting(item, subject, start_time)
+        ]
+
+    def _list_onedrive_recordings_folder(self) -> list[dict]:
+        """Fetch all items from OneDrive /Recordings/ folder."""
+        try:
+            resp = self._graph_get(
+                "/me/drive/root:/Recordings:/children",
+                params={"$select": "name,id,size,createdDateTime,@microsoft.graph.downloadUrl"},
+            )
+            return resp.get("value", [])
+        except (httpx.HTTPStatusError, TokenExpiredError):
+            return []
+
+    @staticmethod
+    def _onedrive_file_matches_meeting(
+        item: dict, subject: str, start_time: str,
+    ) -> bool:
+        """Check if a OneDrive recording/transcript file matches a meeting.
+
+        File naming convention: '{Subject}-{YYYYMMDD_HHMMSS}-Meeting {Type}.mp4'
+        Match by subject prefix and date (same day).
+        """
+        name = item.get("name", "")
+        if not subject:
+            return False
+        # Check subject match (file name starts with meeting subject)
+        if not name.startswith(subject):
+            return False
+        # If we have a start_time, check if the file was created on the same day
+        if start_time:
+            file_created = item.get("createdDateTime", "")
+            if file_created and len(start_time) >= 10 and len(file_created) >= 10:
+                return file_created[:10] == start_time[:10]
+        return True
+
+    MAX_TRANSCRIPT_TEXT_SIZE = 10 * 1024 * 1024  # 10 MB — VTT files are small text
+
+    def get_transcript_content(
+        self, meeting_num: str, transcript_id: str,
+    ) -> str:
+        """Download transcript content as text. Refuses to return binary media."""
+        meeting_info = self._resolve_meeting_id(meeting_num)
+        join_url = meeting_info.get("join_url", "")
+
+        # Try Graph onlineMeetings API first (returns real VTT text)
+        if join_url:
+            try:
+                online_id = self._resolve_online_meeting_id(join_url)
+                resp = self._graph_get_content(
+                    f"/me/onlineMeetings/{online_id}/transcripts/{transcript_id}/content",
+                    accept="text/vtt",
+                )
+                return resp.text
+            except (ValueError, httpx.HTTPStatusError):
+                pass
+
+        # Fallback: SharePoint media/transcripts API (returns real VTT)
+        sp_content = self._get_sharepoint_transcript_content(meeting_info, transcript_id)
+        if sp_content:
+            return sp_content
+
+        # Final fallback: download from OneDrive — validate it's actually text
+        resp = self._graph_get_content(f"/me/drive/items/{transcript_id}/content")
+        content_type = resp.headers.get("content-type", "")
+        content_length = int(resp.headers.get("content-length", len(resp.content)))
+
+        if any(t in content_type for t in ("video/", "audio/", "octet-stream")):
+            raise ValueError(
+                "Transcript is stored as a media file, not text. "
+                "Text transcripts require the OnlineMeetings.Read permission "
+                "which is not available in the Teams web token."
+            )
+
+        if content_length > self.MAX_TRANSCRIPT_TEXT_SIZE:
+            raise ValueError(
+                f"Transcript file is unexpectedly large ({content_length / (1024*1024):.1f} MB). "
+                "This may be a media file, not a text transcript. Refusing download."
+            )
+
+        # Final guard: check for MP4 magic bytes (ftyp)
+        raw = resp.content
+        if len(raw) > 8 and raw[4:8] == b"ftyp":
+            raise ValueError(
+                "Transcript file contains MP4 video data, not text. "
+                "Text transcripts require the OnlineMeetings.Read permission."
+            )
+
+        return resp.text
+
+    def download_recording(
+        self, meeting_num: str, recording_id: str, output_path: str,
+    ) -> int:
+        """Download a recording to a file. Returns file size in bytes."""
+        meeting_info = self._resolve_meeting_id(meeting_num)
+        join_url = meeting_info.get("join_url", "")
+
+        # Try Graph onlineMeetings API first
+        if join_url:
+            try:
+                online_id = self._resolve_online_meeting_id(join_url)
+                resp = self._graph_get_content(
+                    f"/me/onlineMeetings/{online_id}/recordings/{recording_id}/content",
+                )
+                with open(output_path, "wb") as f:
+                    f.write(resp.content)
+                return len(resp.content)
+            except (ValueError, httpx.HTTPStatusError):
+                pass
+
+        # Fallback: download from OneDrive
+        resp = self._graph_get_content(f"/me/drive/items/{recording_id}/content")
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+        return len(resp.content)
+
+    # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
 
@@ -1285,6 +1660,30 @@ class TeamsClient:
 
         self._update_id_map(update)
 
+    def _assign_meeting_nums(self, meetings: list) -> None:
+        from .models import Meeting
+
+        def update(id_map: dict) -> None:
+            id_map["meetings"] = {}
+            for index, meeting in enumerate(meetings, 1):
+                meeting.display_num = index
+                id_map["meetings"][str(index)] = {
+                    "event_id": meeting.id,
+                    "join_url": meeting.join_url,
+                    "subject": meeting.subject,
+                    "start_time": meeting.start_time.isoformat() if hasattr(meeting.start_time, "isoformat") else "",
+                }
+
+        self._update_id_map(update)
+
+    def _resolve_meeting_id(self, display_id: str) -> dict:
+        self._refresh_id_map_entry("meetings", display_id)
+        if display_id in self._id_map["meetings"]:
+            return self._id_map["meetings"][display_id]
+        raise ValueError(
+            f"Unknown meeting #{display_id}. Run 'teams meetings' first to populate the ID map."
+        )
+
     def _resolve_chat_titles(self, messages: list[Message]) -> None:
         """Resolve conversation IDs to chat titles for search results."""
         # Build a reverse map: conv_id -> chat_num from the id_map
@@ -1357,6 +1756,7 @@ class TeamsClient:
             id_map = {}
         id_map.setdefault("chats", {})
         id_map.setdefault("messages", {})
+        id_map.setdefault("meetings", {})
         return id_map
 
     def _read_id_map_from_disk(self) -> dict:
@@ -1517,12 +1917,29 @@ class TeamsClient:
     # HTTP helpers — Graph
     # ------------------------------------------------------------------
 
-    def _graph_get(self, path: str, params: dict | None = None) -> dict:
+    def _graph_get(self, path: str, params: dict | None = None, beta: bool = False) -> dict:
         token = self._graph or self._ic3
         self._session.jitter(is_write=False)
         headers = self._session.browser_headers(token)
-        url = f"{GRAPH_BASE}{path}"
+        base = GRAPH_BETA_BASE if beta else GRAPH_BASE
+        url = f"{base}{path}"
         return self._request_with_retry("GET", url, headers, params=params)
+
+    def _graph_get_content(
+        self, path: str, accept: str = "application/octet-stream", beta: bool = False,
+    ) -> httpx.Response:
+        """GET raw content (non-JSON) from Graph API."""
+        token = self._graph or self._ic3
+        self._session.jitter(is_write=False)
+        headers = self._session.browser_headers(token)
+        headers["Accept"] = accept
+        base = GRAPH_BETA_BASE if beta else GRAPH_BASE
+        url = f"{base}{path}"
+        resp = self._session.client.request("GET", url, headers=headers)
+        if resp.status_code == 401:
+            raise TokenExpiredError("Token expired. Run: teams login")
+        resp.raise_for_status()
+        return resp
 
     def _graph_post(
         self,
@@ -1533,7 +1950,7 @@ class TeamsClient:
         token = self._graph or self._ic3
         self._session.jitter(is_write=True)
         headers = self._session.browser_headers(token)
-        base = "https://graph.microsoft.com/beta" if beta else GRAPH_BASE
+        base = GRAPH_BETA_BASE if beta else GRAPH_BASE
         url = f"{base}{path}"
         return self._request_with_retry("POST", url, headers, json_data=json_data)
 

@@ -12,6 +12,7 @@ CHATSVC_BASE = "https://teams.cloud.microsoft/api/chatsvc/{region}/v1"
 MT_BASE = "https://teams.cloud.microsoft/api/mt/{region}/beta"
 UPS_BASE = "https://teams.cloud.microsoft/ups/{region}/v1"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+GRAPH_BETA_BASE = "https://graph.microsoft.com/beta"
 SUBSTRATE_SEARCH_BASE = "https://substrate.office.com/searchservice/api/v2/query"
 
 # User-Agent

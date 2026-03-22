@@ -154,7 +154,7 @@ def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
             raise ValueError("Invalid token format for 'ic3'. Expected JWT with 3 parts (header.payload.signature).")
 
         # Validate optional tokens
-        optional_keys = ("graph", "presence", "csa", "substrate")
+        optional_keys = ("graph", "presence", "csa", "substrate", "sharepoint")
         for key in optional_keys:
             val = parsed.get(key, "")
             if val and len(val.split(".")) != 3:
@@ -166,6 +166,7 @@ def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
             "presence": parsed.get("presence", ""),
             "csa": parsed.get("csa", ""),
             "substrate": parsed.get("substrate", ""),
+            "sharepoint": parsed.get("sharepoint", ""),
             "region": parsed.get("region", region),
             "user_id": _decode_user_id(ic3),
         }
@@ -222,6 +223,8 @@ def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
                             tokens['csa'] = secret;
                         } else if (target.includes('substrate.office.com') || key.includes('substrate.office.com')) {
                             tokens['substrate'] = secret;
+                        } else if (target.includes('.sharepoint.com') || key.includes('.sharepoint.com')) {
+                            tokens['sharepoint'] = secret;
                         }
                     }
                 } catch(e) {}
@@ -364,6 +367,7 @@ def _load_cached_tokens() -> dict[str, str] | None:
             "presence": data.get("presence", ""),
             "csa": data.get("csa", ""),
             "substrate": data.get("substrate", ""),
+            "sharepoint": data.get("sharepoint", ""),
             "region": data.get("region", "emea"),
             "user_id": data.get("user_id", ""),
         }
@@ -381,6 +385,7 @@ def _save_tokens(tokens: dict[str, str]) -> None:
         "presence": tokens.get("presence", ""),
         "csa": tokens.get("csa", ""),
         "substrate": tokens.get("substrate", ""),
+        "sharepoint": tokens.get("sharepoint", ""),
         "region": tokens.get("region", "emea"),
         "user_id": tokens.get("user_id", ""),
     }

@@ -166,6 +166,20 @@ Available statuses: `Available`, `Busy`, `DoNotDisturb`, `BeRightBack`, `Away`, 
   <img src="assets/status.svg" alt="teams status" width="500">
 </p>
 
+### Meetings, Recordings & Transcripts
+
+```sh
+teams meetings                      # upcoming meetings (next 7 days)
+teams meetings --past --days 14     # past meetings
+teams meetings --today              # today's meetings
+teams recordings 1                  # list recordings for meeting #1
+teams transcripts 1                 # list transcripts for meeting #1
+teams transcripts 1 --view          # display transcript in terminal
+teams transcripts 1 --download t.vtt # save transcript to file
+```
+
+> **Note:** Transcript access uses a SharePoint cookie-based fallback (via Playwright headless browser) because the Teams web SPA token lacks the `OnlineMeetings.Read` scope. Run `teams login` first and re-login if transcripts stop working (cookies expire). Transcripts are returned in VTT format without speaker attribution.
+
 ## JSON Output
 
 **Auto-JSON on pipe:** When stdout is piped, JSON output is automatic — no `--json` flag needed.
