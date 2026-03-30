@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import time
+from datetime import datetime, timezone
 from base64 import urlsafe_b64decode
 from pathlib import Path
 
@@ -17,6 +19,8 @@ from .constants import (
     USER_AGENT,
     USER_PROFILE_FILE,
 )
+
+TOKEN_KEYS = ("ic3", "graph", "presence", "csa", "substrate")
 
 
 def get_tokens() -> dict[str, str]:
@@ -62,8 +66,8 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
         )
         page = context.new_page()
 
-        print("Opening Teams... Log in and wait for the app to fully load.")
-        print("The browser will close automatically once tokens are captured.")
+        _print_stderr("Opening Teams... Log in and wait for the app to fully load.")
+        _print_stderr("The browser will close automatically once tokens are captured.")
         page.goto(TEAMS_URL, wait_until="domcontentloaded")
 
         # Poll until Teams fully settles so secondary tokens are also captured.
@@ -83,7 +87,7 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
                         tokens[key] = value
             except Exception as e:
                 if debug:
-                    print(f"  [debug] Token extraction error: {e}")
+                    _print_stderr(f"  [debug] Token extraction error: {e}")
 
             if tokens.get("ic3"):
                 if grace_deadline is None:
@@ -262,15 +266,15 @@ def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
     if debug:
         for k, v in result.items():
             if k in ("ic3", "graph", "presence", "csa", "substrate"):
-                print(f"  [debug] {k} token: {len(v)} chars")
+                _print_stderr(f"  [debug] {k} token: {len(v)} chars")
             else:
-                print(f"  [debug] {k}: {v}")
+                _print_stderr(f"  [debug] {k}: {v}")
 
     # Extract user_id from IC3 token
     if result.get("ic3"):
         result["user_id"] = _decode_user_id(result["ic3"])
         if debug:
-            print(f"  [debug] user_id: {result.get('user_id', 'unknown')}")
+            _print_stderr(f"  [debug] user_id: {result.get('user_id', 'unknown')}")
 
     # Default region
     if "region" not in result:
@@ -302,6 +306,75 @@ def verify_tokens(tokens: dict[str, str]) -> bool:
         return resp.status_code == 200
     except Exception:
         return False
+
+
+def get_auth_status(check: bool = False) -> dict[str, object]:
+    """Inspect the current auth state without triggering interactive login."""
+    source = "missing"
+    active_tokens: dict[str, str] | None = None
+    raw_cache = _load_cached_tokens_raw()
+
+    env_token = os.environ.get("TEAMS_IC3_TOKEN")
+    if env_token:
+        source = "env"
+        active_tokens = {
+            "ic3": env_token,
+            "graph": "",
+            "presence": "",
+            "csa": "",
+            "substrate": "",
+            "region": os.environ.get("TEAMS_REGION", "emea"),
+            "user_id": _decode_user_id(env_token),
+        }
+    elif raw_cache and raw_cache.get("ic3"):
+        source = "cache"
+        cached_tokens = _load_cached_tokens()
+        if cached_tokens:
+            active_tokens = cached_tokens
+
+    token_snapshot = active_tokens or raw_cache or {}
+    ic3 = token_snapshot.get("ic3", "")
+    display_name = _decode_display_name(ic3) if ic3 else ""
+    if not display_name and USER_PROFILE_FILE.exists():
+        try:
+            display_name = json.loads(USER_PROFILE_FILE.read_text()).get("display_name", "")
+        except (json.JSONDecodeError, OSError, AttributeError):
+            display_name = ""
+
+    exp = token_snapshot.get("ic3_exp") or (_decode_exp(ic3) if ic3 else 0)
+    expires_at = None
+    expires_in_seconds = None
+    expires_in_human = None
+    if exp:
+        expires_at = datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat()
+        expires_in_seconds = int(float(exp) - time.time())
+        expires_in_human = _format_expires_in(expires_in_seconds)
+
+    ic3_valid = None
+    if check and token_snapshot.get("ic3"):
+        ic3_valid = verify_tokens(_coerce_token_bundle(token_snapshot))
+
+    return {
+        "auth_source": source,
+        "cache": {
+            "token_cache_exists": TOKENS_FILE.exists(),
+            "token_cache_path": str(TOKENS_FILE),
+            "browser_state_exists": BROWSER_STATE_FILE.exists(),
+            "browser_state_path": str(BROWSER_STATE_FILE),
+        },
+        "identity": {
+            "region": token_snapshot.get("region", os.environ.get("TEAMS_REGION", "emea")),
+            "user_id": token_snapshot.get("user_id", _decode_user_id(ic3) if ic3 else ""),
+            "display_name": display_name,
+        },
+        "tokens": {key: bool(token_snapshot.get(key, "")) for key in TOKEN_KEYS},
+        "ic3": {
+            "expires_at": expires_at,
+            "expires_in_seconds": expires_in_seconds,
+            "expires_in_human": expires_in_human,
+            "valid": ic3_valid,
+        },
+    }
 
 
 def _decode_user_id(token: str) -> str:
@@ -347,27 +420,35 @@ def _decode_display_name(token: str) -> str:
 
 
 def _load_cached_tokens() -> dict[str, str] | None:
+    data = _load_cached_tokens_raw()
+    if not data:
+        return None
+
+    ic3 = data.get("ic3")
+    if not ic3:
+        return None
+
+    exp = data.get("ic3_exp", 0)
+    # Check expiry with 5-minute buffer
+    if time.time() > exp - 300:
+        return None
+    return {
+        "ic3": ic3,
+        "graph": data.get("graph", ""),
+        "presence": data.get("presence", ""),
+        "csa": data.get("csa", ""),
+        "substrate": data.get("substrate", ""),
+        "region": data.get("region", "emea"),
+        "user_id": data.get("user_id", ""),
+    }
+
+
+def _load_cached_tokens_raw() -> dict[str, object] | None:
     if not TOKENS_FILE.exists():
         return None
     try:
-        data = json.loads(TOKENS_FILE.read_text())
-        ic3 = data.get("ic3")
-        if not ic3:
-            return None
-        exp = data.get("ic3_exp", 0)
-        # Check expiry with 5-minute buffer
-        if time.time() > exp - 300:
-            return None
-        return {
-            "ic3": ic3,
-            "graph": data.get("graph", ""),
-            "presence": data.get("presence", ""),
-            "csa": data.get("csa", ""),
-            "substrate": data.get("substrate", ""),
-            "region": data.get("region", "emea"),
-            "user_id": data.get("user_id", ""),
-        }
-    except (json.JSONDecodeError, KeyError):
+        return json.loads(TOKENS_FILE.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
         return None
 
 
@@ -400,3 +481,41 @@ def _chmod_600(path: Path) -> None:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+
+
+def _format_expires_in(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    if seconds < 0:
+        seconds = abs(seconds)
+        suffix = "ago"
+    else:
+        suffix = ""
+
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    rendered = " ".join(parts)
+    return f"{rendered} {suffix}".strip()
+
+
+def _print_stderr(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _coerce_token_bundle(data: dict[str, object]) -> dict[str, str]:
+    return {
+        "ic3": str(data.get("ic3", "") or ""),
+        "graph": str(data.get("graph", "") or ""),
+        "presence": str(data.get("presence", "") or ""),
+        "csa": str(data.get("csa", "") or ""),
+        "substrate": str(data.get("substrate", "") or ""),
+        "region": str(data.get("region", "emea") or "emea"),
+        "user_id": str(data.get("user_id", "") or ""),
+    }

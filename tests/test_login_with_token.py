@@ -124,13 +124,13 @@ class TestLoginWithTokenCLI:
 
     def test_with_token_rejects_empty_stdin(self, runner, console_capture):
         result = runner.invoke(cli_mod.cli, ["login", "--with-token"], input="")
-        assert result.exit_code == 1
-        assert "No token provided" in console_capture.getvalue()
+        assert result.exit_code == 2
+        assert "No token provided" in result.output
 
     def test_with_token_rejects_invalid_jwt(self, runner, console_capture):
         result = runner.invoke(cli_mod.cli, ["login", "--with-token"], input="bad_token\n")
-        assert result.exit_code == 1
-        assert "Invalid token format" in console_capture.getvalue()
+        assert result.exit_code == 2
+        assert "Invalid token format" in result.output
 
     def test_with_token_plain_token_succeeds(self, runner, console_capture, mocker, fake_tokens):
         mocker.patch.object(commands_auth_mod, "login_with_token", return_value=fake_tokens)
@@ -175,8 +175,8 @@ class TestLoginWithTokenCLI:
 
     def test_region_without_with_token_errors(self, runner, console_capture):
         result = runner.invoke(cli_mod.cli, ["login", "--region", "amer"])
-        assert result.exit_code == 1
-        assert "--region is only used with --with-token" in console_capture.getvalue()
+        assert result.exit_code == 2
+        assert "--region is only used with --with-token" in result.output
 
     def test_with_token_shows_optional_token_count_all(self, runner, console_capture, mocker, fake_tokens):
         mocker.patch.object(commands_auth_mod, "login_with_token", return_value=fake_tokens)

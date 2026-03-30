@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .constants import CONFIG_FILE
+from . import constants
 
 DEFAULTS = {
     "max_messages": 25,
@@ -26,7 +26,7 @@ DEFAULTS = {
 def load_config(path: Path | None = None) -> dict:
     """Load YAML config, falling back to defaults for missing keys."""
     cfg = dict(DEFAULTS)
-    p = path or CONFIG_FILE
+    p = path or constants.CONFIG_FILE
     if p.exists():
         with open(p) as f:
             user = yaml.safe_load(f) or {}
