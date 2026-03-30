@@ -4,8 +4,17 @@ from __future__ import annotations
 
 import click
 
-from ..formatter import console, print_error, print_success, print_users
-from ._common import _get_client, _handle_api_error
+from ..exceptions import ResourceNotFoundError
+from ..formatter import console, print_success
+from ._common import (
+    _get_client,
+    _handle_api_error,
+    emit_dry_run,
+    get_runtime_options,
+    ensure_interactive_allowed,
+    require_confirmation,
+    should_skip_confirmation,
+)
 
 
 def register(cli: click.Group) -> None:
@@ -21,6 +30,12 @@ def register(cli: click.Group) -> None:
 @_handle_api_error
 def group_chat(users: tuple[str, ...], topic: str, message: str, yes: bool):
     """Create a group chat with multiple users. Users can be names or emails."""
+    if emit_dry_run(
+        "create group chat",
+        {"users": list(users), "topic": topic, "message": message},
+    ):
+        return
+
     client = _get_client()
 
     # Resolve each user query to a User object
@@ -28,25 +43,28 @@ def group_chat(users: tuple[str, ...], topic: str, message: str, yes: bool):
     for query in users:
         found = client.search_users(query, top=5)
         if not found:
-            print_error(f"No user found matching '{query}'")
-            return
-        if len(found) > 1 and not yes:
+            raise ResourceNotFoundError(f"No user found matching '{query}'")
+        if len(found) > 1 and not should_skip_confirmation(yes):
             console.print(f"[bold]Multiple users found for '{query}':[/bold]")
             for i, u in enumerate(found, 1):
                 console.print(f"  {i}. {u.display_name} ({u.email})")
+            if get_runtime_options().no_input:
+                raise click.UsageError(
+                    "Refusing to select group chat members interactively (--no-input set; use --force/--yes with unambiguous user queries)."
+                )
             choice = click.prompt("Select user", type=int, default=1)
             resolved.append(found[choice - 1])
         else:
             resolved.append(found[0])
 
-    if not yes:
+    if not should_skip_confirmation(yes):
         console.print("[bold]Create group chat:[/bold]")
         if topic:
             console.print(f"  [bold]Topic:[/bold] {topic}")
         console.print(f"  [bold]Members:[/bold] {', '.join(u.display_name for u in resolved)}")
         if message:
             console.print(f"  [bold]Message:[/bold] {message[:100]}{'...' if len(message) > 100 else ''}")
-        click.confirm("Create this group chat?", abort=True)
+        require_confirmation("Create this group chat?", "create a group chat", local_force=yes)
 
     user_ids = [u.id for u in resolved]
     result = client.create_group_chat(user_ids, topic)
@@ -66,9 +84,16 @@ def group_chat(users: tuple[str, ...], topic: str, message: str, yes: bool):
 @_handle_api_error
 def forward(msg_num: str, chat_num: str, comment: str, yes: bool):
     """Forward a message to another chat."""
+    if emit_dry_run(
+        "forward message",
+        {"message_num": f"#{msg_num}", "chat": f"#{chat_num}", "comment": comment},
+    ):
+        return
+
     client = _get_client()
 
-    if not yes:
+    if not should_skip_confirmation(yes):
+        ensure_interactive_allowed("forward a message", local_force=yes)
         original = client.get_message_detail(msg_num)
         preview = (original.text_content or "").strip()
         console.print(f"  [bold]Message:[/bold] #{msg_num} from {original.sender}")
@@ -77,7 +102,7 @@ def forward(msg_num: str, chat_num: str, comment: str, yes: bool):
         console.print(f"  [bold]To Chat:[/bold] #{chat_num}")
         if comment:
             console.print(f"  [bold]Comment:[/bold] {comment[:100]}{'...' if len(comment) > 100 else ''}")
-        click.confirm("Forward this message?", abort=True)
+        require_confirmation("Forward this message?", "forward a message", local_force=yes)
 
     client.forward_message(msg_num, chat_num, comment=comment)
     print_success(f"Message #{msg_num} forwarded to chat #{chat_num}")

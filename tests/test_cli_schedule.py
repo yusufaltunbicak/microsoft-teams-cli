@@ -105,8 +105,8 @@ def test_schedule_cancel_invalid_index_prints_error(runner, console_capture):
 
     result = runner.invoke(cli_mod.cli, ["schedule-cancel", "2", "-y"])
 
-    assert result.exit_code == 0
-    assert "Invalid index #2" in console_capture.getvalue()
+    assert result.exit_code == 5
+    assert "Invalid index #2" in result.output
 
 
 def test_schedule_run_sends_due_messages_and_marks_sent(runner, mocker):

@@ -180,9 +180,9 @@ def test_send_command_refuses_uncertain_match_with_yes(runner, console_capture, 
 
     result = runner.invoke(cli_mod.cli, ["send", "carol", "Hello", "-y"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert fake_client.sent == []
-    rendered = console_capture.getvalue()
+    rendered = result.output
     assert "No exact match for 'carol'" in rendered
     assert "Refusing to send with -y" in rendered
 

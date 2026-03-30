@@ -5,7 +5,14 @@ from __future__ import annotations
 import click
 
 from ..formatter import print_error, print_success
-from ._common import VALID_REACTIONS, _get_client, _handle_api_error
+from ._common import (
+    VALID_REACTIONS,
+    _get_client,
+    _handle_api_error,
+    emit_dry_run,
+    require_confirmation,
+    should_skip_confirmation,
+)
 
 
 def register(cli: click.Group) -> None:
@@ -27,16 +34,31 @@ def react(emoji: str, msg_nums: tuple[str, ...], yes: bool):
     Example: teams react like 1 2 3
     """
     nums = list(msg_nums)
-    if not yes:
+    if emit_dry_run(
+        "add reaction",
+        {"emoji": emoji, "message_ids": [f"#{n}" for n in nums]},
+    ):
+        return
+
+    if not should_skip_confirmation(yes):
         ids_str = ", ".join(f"#{n}" for n in nums)
-        click.confirm(f"React with {emoji} on messages {ids_str}?", abort=True)
+        require_confirmation(
+            f"React with {emoji} on messages {ids_str}?",
+            "add reactions to messages",
+            local_force=yes,
+        )
     client = _get_client()
+    failures: list[Exception] = []
     for n in nums:
         try:
             client.add_reaction(n, emoji)
             print_success(f"Reacted with {emoji} on message #{n}")
         except Exception as e:
             print_error(f"Failed to react on message #{n}: {e}")
+            failures.append(e)
+
+    if failures:
+        raise failures[0]
 
 
 @click.command()
@@ -53,13 +75,28 @@ def unreact(emoji: str, msg_nums: tuple[str, ...], yes: bool):
     Example: teams unreact like 1 2 3
     """
     nums = list(msg_nums)
-    if not yes:
+    if emit_dry_run(
+        "remove reaction",
+        {"emoji": emoji, "message_ids": [f"#{n}" for n in nums]},
+    ):
+        return
+
+    if not should_skip_confirmation(yes):
         ids_str = ", ".join(f"#{n}" for n in nums)
-        click.confirm(f"Remove {emoji} reaction from messages {ids_str}?", abort=True)
+        require_confirmation(
+            f"Remove {emoji} reaction from messages {ids_str}?",
+            "remove reactions from messages",
+            local_force=yes,
+        )
     client = _get_client()
+    failures: list[Exception] = []
     for n in nums:
         try:
             client.remove_reaction(n, emoji)
             print_success(f"Removed {emoji} from message #{n}")
         except Exception as e:
             print_error(f"Failed to remove reaction from message #{n}: {e}")
+            failures.append(e)
+
+    if failures:
+        raise failures[0]

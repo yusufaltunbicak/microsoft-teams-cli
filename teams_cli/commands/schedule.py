@@ -6,9 +6,18 @@ from datetime import datetime
 
 import click
 
+from ..exceptions import ResourceNotFoundError
 from ..formatter import console, print_error, print_success
 from ..serialization import to_json
-from ._common import _get_client, _handle_api_error, _parse_schedule_time, should_json
+from ._common import (
+    _get_client,
+    _handle_api_error,
+    _parse_schedule_time,
+    emit_dry_run,
+    require_confirmation,
+    should_json,
+    should_skip_confirmation,
+)
 
 
 def register(cli: click.Group) -> None:
@@ -32,15 +41,21 @@ def schedule(chat_num: str, message: str, at: str, yes: bool):
     from ..scheduler import add_scheduled
 
     send_at = _parse_schedule_time(at)
+    if emit_dry_run(
+        "schedule message",
+        {"chat": f"#{chat_num}", "message": message, "at": at},
+    ):
+        return
+
     client = _get_client()
     conv_id = client._resolve_chat_id(chat_num)
 
-    if not yes:
+    if not should_skip_confirmation(yes):
         local_send = send_at.astimezone(datetime.now().astimezone().tzinfo)
         console.print(f"  [bold]Chat:[/bold] #{chat_num}")
         console.print(f"  [bold]Message:[/bold] {message[:100]}{'...' if len(message) > 100 else ''}")
         console.print(f"  [bold]Scheduled:[/bold] {local_send.strftime('%Y-%m-%d %H:%M')}")
-        click.confirm("Schedule this message?", abort=True)
+        require_confirmation("Schedule this message?", "schedule a message", local_force=yes)
 
     add_scheduled(
         conv_id=conv_id,
@@ -103,15 +118,24 @@ def schedule_cancel(index: int, yes: bool):
     pending = [e for e in entries if e.get("status") == "pending"]
 
     if index < 1 or index > len(pending):
-        print_error(f"Invalid index #{index}. Run 'teams schedule-list' to see entries.")
-        return
+        raise ResourceNotFoundError(f"Invalid index #{index}. Run 'teams schedule-list' to see entries.")
 
     entry = pending[index - 1]
-    if not yes:
+    if emit_dry_run(
+        "cancel scheduled message",
+        {"index": index, "chat": entry.get("chat_title", ""), "message": entry.get("content", "")},
+    ):
+        return
+
+    if not should_skip_confirmation(yes):
         console.print(f"  [bold]Chat:[/bold] {entry.get('chat_title', '')}")
         console.print(f"  [bold]Message:[/bold] {entry.get('content', '')[:100]}")
         console.print(f"  [bold]Scheduled:[/bold] {entry.get('send_at', '')}")
-        click.confirm(f"Cancel scheduled message #{index}?", abort=True)
+        require_confirmation(
+            f"Cancel scheduled message #{index}?",
+            "cancel a scheduled message",
+            local_force=yes,
+        )
 
     full_entries = load_scheduled()
     for i, e in enumerate(full_entries):
@@ -135,10 +159,20 @@ def schedule_run():
         print_success("No messages due to send.")
         return
 
+    if emit_dry_run(
+        "run scheduled messages",
+        {
+            "count": len(pending),
+            "chats": [entry.get("chat_title", "") for entry in pending],
+        },
+    ):
+        return
+
     client = _get_client()
     entries = load_scheduled()
 
     sent_count = 0
+    failures: list[Exception] = []
     for entry in pending:
         try:
             conv_id = entry["conv_id"]
@@ -154,5 +188,8 @@ def schedule_run():
             print_success(f"Sent: {entry.get('chat_title', '')} - {content[:50]}")
         except Exception as e:
             print_error(f"Failed to send to {entry.get('chat_title', '')}: {e}")
+            failures.append(e)
 
     print_success(f"\n{sent_count}/{len(pending)} messages sent")
+    if failures:
+        raise failures[0]

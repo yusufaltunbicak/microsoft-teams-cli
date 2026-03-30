@@ -7,8 +7,16 @@ import pytest
 import teams_cli.cli as cli_mod
 import teams_cli.commands.auth as cmd_auth
 import teams_cli.commands.chat as cmd_chat
+import teams_cli.commands.send as cmd_send
 import teams_cli.commands._common as commands_common
 import teams_cli.exceptions as exc_mod
+
+
+def test_no_input_refusal_returns_usage_exit_code_and_human_error(runner, console_capture):
+    result = runner.invoke(cli_mod.cli, ["--no-input", "chat-send", "5", "hello"])
+
+    assert result.exit_code == 2
+    assert "Refusing to send a message to a chat without confirmation" in result.output
 
 
 def test_json_errors_use_envelope_and_not_found_exit_code(runner, mocker):

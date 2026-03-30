@@ -63,7 +63,7 @@ def test_react_partial_failure(runner, console_capture, mocker):
 
     result = runner.invoke(cli_mod.cli, ["react", "like", "1", "2", "3", "-y"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 5
     assert fake_client.calls == [("1", "like"), ("3", "like")]
     output = console_capture.getvalue()
     assert "Failed to react on message #2" in output
@@ -123,7 +123,7 @@ def test_unreact_partial_failure(runner, console_capture, mocker):
 
     result = runner.invoke(cli_mod.cli, ["unreact", "sad", "4", "5", "6", "-y"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 5
     assert fake_client.calls == [("4", "sad"), ("6", "sad")]
     output = console_capture.getvalue()
     assert "Failed to remove reaction from message #5" in output
@@ -183,7 +183,7 @@ def test_mark_read_partial_failure(runner, console_capture, mocker):
 
     result = runner.invoke(cli_mod.cli, ["mark-read", "1", "2", "3", "-y"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 5
     assert fake_client.calls == ["1", "3"]
     output = console_capture.getvalue()
     assert "Failed to mark message #2 as read" in output

@@ -86,8 +86,8 @@ def test_group_chat_user_not_found_prints_error(runner, console_capture, mocker)
 
     result = runner.invoke(cli_mod.cli, ["group-chat", "nobody", "-y"])
 
-    assert result.exit_code == 0
-    assert "No user found matching 'nobody'" in console_capture.getvalue()
+    assert result.exit_code == 5
+    assert "No user found matching 'nobody'" in result.output
 
 
 def test_forward_reads_message_and_sends_to_chat(runner, mocker, make_message):

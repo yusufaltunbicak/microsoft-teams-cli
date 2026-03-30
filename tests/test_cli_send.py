@@ -85,8 +85,8 @@ def test_send_no_user_prints_error(runner, console_capture, mocker):
 
     result = runner.invoke(cli_mod.cli, ["send", "nobody", "Hello"])
 
-    assert result.exit_code == 0
-    assert "No user found matching 'nobody'" in console_capture.getvalue()
+    assert result.exit_code == 5
+    assert "No user found matching 'nobody'" in result.output
 
 
 def test_send_file_calls_client(runner, mocker, tmp_path: Path):
