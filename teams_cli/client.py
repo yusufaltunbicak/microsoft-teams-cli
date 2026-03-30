@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import secrets
 import tempfile
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import escape
 from pathlib import Path
 from typing import Iterator
@@ -35,6 +37,7 @@ from .exceptions import (
     ApiError,
     RateLimitError,
     ResourceNotFoundError,
+    RetryableError,
     TokenExpiredError,
 )
 from .models import Attachment, Chat, Message, User
@@ -44,6 +47,10 @@ class TeamsClient:
     """HTTP client for Teams Chat Service, Middle Tier, and Graph APIs."""
 
     MAX_ID_MAP_SIZE = 500
+    MAX_RETRIES_429 = 3
+    MAX_RETRIES_5XX = 1
+    CIRCUIT_BREAKER_THRESHOLD = 5
+    CIRCUIT_BREAKER_RESET_SECONDS = 30
 
     def __init__(self, tokens: dict[str, str]):
         self._tokens = tokens
@@ -66,6 +73,10 @@ class TeamsClient:
         from .config import load_config
         _cfg = load_config()
         self._session = BrowserSession(timeout=_cfg.get("timeout", 30))
+        self._circuit_breaker = _CircuitBreaker(
+            threshold=self.CIRCUIT_BREAKER_THRESHOLD,
+            reset_seconds=self.CIRCUIT_BREAKER_RESET_SECONDS,
+        )
 
         # Cache for user display name lookups (user_id -> display_name)
         self._user_name_cache: dict[str, str] = {}
@@ -264,7 +275,7 @@ class TeamsClient:
                 msg.display_num = int(msg_num)
                 return msg
 
-        raise ValueError(f"Message #{msg_num} not found. Try re-reading the chat.")
+        raise ResourceNotFoundError(f"Message #{msg_num} not found. Try re-reading the chat.")
 
     # ------------------------------------------------------------------
     # Send messages
@@ -385,13 +396,9 @@ class TeamsClient:
             "properties": {"threadType": "chat"},
         }
 
-        # Use raw request to capture Location header (thread ID)
-        headers = self._session.browser_headers(self._ic3)
-        url = f"{self._chatsvc}/threads"
-        self._session.jitter(is_write=True)
-        raw_resp = self._session.client.request("POST", url, headers=headers, json=payload)
-        if raw_resp.status_code == 403:
-            raw_resp.raise_for_status()
+        raw_resp = self._ic3_post_raw("/threads", json_data=payload, is_write=True)
+        if raw_resp.status_code >= 400:
+            self._handle_response(raw_resp)
 
         # Extract thread ID from Location header
         location = raw_resp.headers.get("location", "")
@@ -905,7 +912,7 @@ class TeamsClient:
 
         path = Path(file_path)
         if not path.exists():
-            raise ValueError(f"File not found: {file_path}")
+            raise ResourceNotFoundError(f"File not found: {file_path}")
 
         file_name = path.name
         file_size = path.stat().st_size
@@ -1066,7 +1073,7 @@ class TeamsClient:
         """
         url = attachment.content_url
         if not url:
-            raise ValueError(f"No download URL for attachment '{attachment.name}'")
+            raise ResourceNotFoundError(f"No download URL for attachment '{attachment.name}'")
 
         self._session.jitter(is_write=False)
 
@@ -1232,7 +1239,7 @@ class TeamsClient:
             or len(display_id) > 50
         ):
             return display_id
-        raise ValueError(
+        raise ResourceNotFoundError(
             f"Unknown chat #{display_id}. Run 'teams chats' first to populate the ID map."
         )
 
@@ -1240,7 +1247,7 @@ class TeamsClient:
         self._refresh_id_map_entry("messages", display_id)
         if display_id in self._id_map["messages"]:
             return self._id_map["messages"][display_id]
-        raise ValueError(
+        raise ResourceNotFoundError(
             f"Unknown message #{display_id}. Read a chat first to populate the ID map."
         )
 
@@ -1436,19 +1443,65 @@ class TeamsClient:
         json_data: dict | None = None,
         max_retries: int = 3,
     ) -> dict:
-        """Execute HTTP request with automatic retry on 429 rate limiting."""
-        for attempt in range(max_retries + 1):
-            resp = self._session.client.request(
-                method, url, headers=headers, params=params, json=json_data,
-            )
+        """Execute HTTP request with retry hardening for 429/5xx/network failures."""
+        resp = self._request_raw_with_retry(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json_data=json_data,
+            max_retries=max_retries,
+        )
+        return self._handle_response(resp)
+
+    def _request_raw_with_retry(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        params: dict | None = None,
+        json_data: dict | list | None = None,
+        max_retries: int = 3,
+    ) -> httpx.Response:
+        self._circuit_breaker.raise_if_open()
+        retries_429 = 0
+        retries_5xx = 0
+        retries_network = 0
+
+        while True:
             try:
-                return self._handle_response(resp)
-            except RateLimitError:
-                if attempt >= max_retries:
-                    raise
-                retry_after = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
-                time.sleep(retry_after)
-        raise RateLimitError("Max retries exceeded")
+                resp = self._session.client.request(
+                    method, url, headers=headers, params=params, json=json_data,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                self._circuit_breaker.record_failure()
+                if retries_network >= self.MAX_RETRIES_5XX:
+                    raise RetryableError(str(exc)) from exc
+                retries_network += 1
+                time.sleep(1)
+                continue
+
+            if resp.status_code < 400:
+                self._circuit_breaker.record_success()
+                return resp
+
+            if resp.status_code == 429:
+                if retries_429 >= min(max_retries, self.MAX_RETRIES_429):
+                    self._circuit_breaker.record_failure()
+                    return resp
+                retries_429 += 1
+                time.sleep(self._retry_after_delay(resp, retries_429))
+                continue
+
+            if resp.status_code >= 500:
+                self._circuit_breaker.record_failure()
+                if retries_5xx >= self.MAX_RETRIES_5XX:
+                    return resp
+                retries_5xx += 1
+                time.sleep(1)
+                continue
+
+            return resp
 
     # ------------------------------------------------------------------
     # HTTP helpers — IC3 Chat Service
@@ -1470,6 +1523,17 @@ class TeamsClient:
         headers = self._session.browser_headers(self._ic3)
         url = f"{self._chatsvc}{path}"
         return self._request_with_retry("POST", url, headers, json_data=json_data)
+
+    def _ic3_post_raw(
+        self,
+        path: str,
+        json_data: dict | None = None,
+        is_write: bool = False,
+    ) -> httpx.Response:
+        self._session.jitter(is_write=is_write)
+        headers = self._session.browser_headers(self._ic3)
+        url = f"{self._chatsvc}{path}"
+        return self._request_raw_with_retry("POST", url, headers, json_data=json_data)
 
     def _ic3_put(
         self,
@@ -1576,6 +1640,64 @@ class TeamsClient:
             return {}
         return resp.json()
 
+    def _retry_after_delay(self, resp: httpx.Response, attempt: int) -> float:
+        retry_after = resp.headers.get("Retry-After", "")
+        parsed = self._parse_retry_after(retry_after)
+        if parsed is not None:
+            return parsed
+
+        base_delay = float(2 ** max(attempt - 1, 0))
+        return base_delay + random.uniform(0.0, 0.25)
+
+    @staticmethod
+    def _parse_retry_after(value: str) -> float | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+
+        if value.isdigit():
+            return float(value)
+
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+class _CircuitBreaker:
+    def __init__(self, threshold: int = 5, reset_seconds: int = 30):
+        self.threshold = threshold
+        self.reset_seconds = reset_seconds
+        self.failures = 0
+        self.opened_at = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        if not self.opened_at:
+            return False
+        if time.time() - self.opened_at >= self.reset_seconds:
+            self.failures = 0
+            self.opened_at = 0.0
+            return False
+        return True
+
+    def raise_if_open(self) -> None:
+        if self.is_open:
+            raise RetryableError("Circuit breaker is open. Try again later.")
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.opened_at = 0.0
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        if self.failures >= self.threshold:
+            self.opened_at = time.time()
+
 
 # Backward-compat re-exports (exceptions now live in exceptions.py)
-__all__ = ["TeamsClient", "TokenExpiredError", "RateLimitError"]
+__all__ = ["TeamsClient", "TokenExpiredError", "RateLimitError", "_CircuitBreaker"]

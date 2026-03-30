@@ -32,6 +32,7 @@ def test_request_with_retry_uses_exponential_backoff_without_retry_after(
     ]
 
     mocker.patch.object(teams_client._session.client, "request", side_effect=responses)
+    mocker.patch("teams_cli.client.random.uniform", return_value=0.0)
     sleep = mocker.patch("teams_cli.client.time.sleep")
 
     payload = teams_client._request_with_retry(
@@ -41,7 +42,7 @@ def test_request_with_retry_uses_exponential_backoff_without_retry_after(
     )
 
     assert payload == {"ok": True}
-    sleep.assert_called_once_with(2)
+    sleep.assert_called_once_with(1.0)
 
 
 def test_request_with_retry_does_not_retry_non_rate_limit_errors(

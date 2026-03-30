@@ -7,6 +7,7 @@ import respx
 from httpx import HTTPStatusError, Request, Response
 
 from teams_cli.client import TeamsClient
+import teams_cli.exceptions as exc_mod
 from teams_cli.models import Attachment
 
 
@@ -246,7 +247,7 @@ def test_download_attachment_without_url_raises(teams_client):
         content_url="",
     )
 
-    with pytest.raises(ValueError, match="No download URL"):
+    with pytest.raises(exc_mod.ResourceNotFoundError, match="No download URL"):
         teams_client.download_attachment(attachment)
 
 

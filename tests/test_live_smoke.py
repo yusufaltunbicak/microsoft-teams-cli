@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from teams_cli.auth import get_tokens, verify_tokens
-from teams_cli.client import TeamsClient
+from teams_cli.client import TeamsClient, TokenExpiredError
 
 pytestmark = pytest.mark.live
 
@@ -94,70 +94,163 @@ def _parse_json_stdout(result: subprocess.CompletedProcess[str]):
 
 def test_live_read_only_smoke():
     _require_live_opt_in()
-    print("live: loading tokens", flush=True)
-    tokens = get_tokens()
+    print("live: running whoami --json", flush=True)
+    whoami_result = _run_cli("whoami", "--json")
+    assert whoami_result.returncode == 0, whoami_result.stderr
+    whoami_payload = _parse_json_stdout(whoami_result)
+    assert whoami_payload is not None
 
-    print("live: verifying tokens", flush=True)
-    assert _call_with_timeout(20, "token verification", verify_tokens, tokens) is True
-
-    client = _live_client()
-    print("live: reading profile", flush=True)
-    me = _call_with_timeout(20, "whoami", client.get_me)
     print("live: listing chats", flush=True)
-    chats = _call_with_timeout(20, "chat listing", client.get_chats, 3)
+    chats_result = _run_cli("chats", "--json")
+    assert chats_result.returncode == 0, chats_result.stderr
+    chats_payload = _parse_json_stdout(chats_result)
+    assert chats_payload is not None
 
+    me = whoami_payload["data"]
+    chats = chats_payload["data"]
     assert me["displayName"]
-    assert me.get("mail")
     assert isinstance(chats, list)
+
+
+def test_live_cli_dry_run_and_no_input_are_safe_for_send():
+    _require_live_opt_in()
+    client = _live_client()
+    print("live: reading profile for safe send flags", flush=True)
+    me = _call_with_timeout(20, "whoami", client.get_me)
+    email = me.get("mail")
+    token = uuid.uuid4().hex[:8]
+    if email:
+        dry_run_args = ["--dry-run", "send", email, f"[teams-cli live dry-run] {token}"]
+        no_input_args = ["--no-input", "send", email, f"[teams-cli live no-input] {token}"]
+        refusal = "Refusing to send a direct message without confirmation"
+    else:
+        dry_run_args = ["--dry-run", "chat-send", "48:notes", f"[teams-cli live dry-run] {token}"]
+        no_input_args = ["--no-input", "chat-send", "48:notes", f"[teams-cli live no-input] {token}"]
+        refusal = "Refusing to send a message to a chat without confirmation"
+
+    print(f"live: running {' '.join(dry_run_args[:3])}", flush=True)
+    dry_run = _run_cli(*dry_run_args)
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert "dry_run" in dry_run.stdout or "Dry run:" in (dry_run.stdout + dry_run.stderr)
+
+    print(f"live: running {' '.join(no_input_args[:3])}", flush=True)
+    no_input = _run_cli(*no_input_args)
+    assert no_input.returncode == 2, no_input.stderr
+    assert refusal in (no_input.stdout + no_input.stderr)
+
+
+def test_live_auth_status_matches_whoami():
+    _require_live_opt_in()
+
+    print("live: running whoami --json", flush=True)
+    whoami_result = _run_cli("whoami", "--json")
+    assert whoami_result.returncode == 0, whoami_result.stderr
+    whoami_payload = _parse_json_stdout(whoami_result)
+    assert whoami_payload is not None
+
+    print("live: running auth-status --json", flush=True)
+    auth_status_result = _run_cli("auth-status", "--json")
+    assert auth_status_result.returncode == 0, auth_status_result.stderr
+    auth_status_payload = _parse_json_stdout(auth_status_result)
+    assert auth_status_payload is not None
+
+    print("live: running auth-status --check --json", flush=True)
+    auth_check_result = _run_cli("auth-status", "--check", "--json")
+    assert auth_check_result.returncode == 0, auth_check_result.stderr
+    auth_check_payload = _parse_json_stdout(auth_check_result)
+    assert auth_check_payload is not None
+
+    whoami_data = whoami_payload["data"]
+    auth_status_data = auth_status_payload["data"]
+    auth_check_data = auth_check_payload["data"]
+
+    assert auth_status_data["identity"]["region"] == whoami_data["region"]
+    assert auth_status_data["identity"]["user_id"] == whoami_data["user_id"]
+    assert isinstance(auth_check_data["tokens"]["ic3"], bool)
+    assert isinstance(auth_check_data["ic3"]["valid"], bool)
+
+
+def test_live_cli_exit_code_contract():
+    _require_live_opt_in()
+
+    print("live: running success exit-code probe", flush=True)
+    success = _run_cli("auth-status", "--json")
+    assert success.returncode == 0, success.stderr
+
+    print("live: running usage exit-code probe", flush=True)
+    usage = _run_cli("auth-status", "--bogus")
+    assert usage.returncode == 2, usage.stderr
+
+    print("live: running refusal exit-code probe", flush=True)
+    refusal = _run_cli("--no-input", "chat-send", "48:notes", f"[teams-cli live refusal] {uuid.uuid4().hex[:8]}")
+    assert refusal.returncode == 2, refusal.stderr
+
+
+def test_live_cli_command_allowlist():
+    _require_live_opt_in()
+
+    print("live: running allowlisted read-only command", flush=True)
+    allowed = _run_cli("--enable-commands", "auth-status,status", "auth-status", "--json")
+    assert allowed.returncode == 0, allowed.stderr
+
+    print("live: running denied command probe", flush=True)
+    denied = _run_cli("--enable-commands", "status", "auth-status")
+    assert denied.returncode == 2, denied.stderr
+
+    print("live: running allowlisted dry-run write probe", flush=True)
+    dry_run = _run_cli(
+        "--enable-commands",
+        "chat-send",
+        "--dry-run",
+        "chat-send",
+        "48:notes",
+        f"[teams-cli live allowlist] {uuid.uuid4().hex[:8]}",
+    )
+    assert dry_run.returncode == 0, dry_run.stderr
 
 
 def test_live_self_notes_send_search_read_react_flow():
     _require_live_opt_in()
-    client = _live_client()
-    print("live: reading profile for self-target", flush=True)
-    me = _call_with_timeout(20, "whoami", client.get_me)
-    email = me.get("mail")
-    if not email:
-        pytest.skip("Authenticated user has no email address available for self-lookup.")
-
-    print("live: resolving self user lookup", flush=True)
-    users = _call_with_timeout(20, "self user lookup", client.search_users, email, 5)
-    if not any(user.id == client._user_id for user in users):
-        pytest.skip("Self lookup did not resolve back to the authenticated user.")
-
-    print("live: resolving self conversation", flush=True)
-    conv_id = "48:notes"
-    _call_with_timeout(
-        20,
-        "self notes preflight",
-        client._ic3_get,
-        f"/users/ME/conversations/{conv_id}/messages",
-        params={"view": "msnp24Equivalent|supportsMessageProperties", "pageSize": 5},
-    )
-
     token = uuid.uuid4().hex[:10]
     content = f"[teams-cli live test] self smoke {token}"
-    print("live: sending self message", flush=True)
-    _call_with_timeout(20, "self message send", client.send_message, conv_id, content)
+    print("live: sending self message through CLI", flush=True)
+    send_result = _run_cli("chat-send", "48:notes", content, "-y")
+    assert send_result.returncode == 0, send_result.stderr
 
-    print("live: reading back message", flush=True)
-    message = _find_message_by_token(client, conv_id, token)
-    if message is None:
-        pytest.fail("Sent message could not be read back from the self conversation.")
+    print("live: searching for sent message through CLI", flush=True)
+    search_result = None
+    for _ in range(8):
+        candidate = _run_cli("search", token, "--max", "5", "--json")
+        assert candidate.returncode == 0, candidate.stderr
+        payload = _parse_json_stdout(candidate)
+        assert payload is not None
+        matches = payload["data"]
+        if matches:
+            search_result = matches[0]
+            break
+        time.sleep(2)
 
-    print("live: searching for sent message", flush=True)
-    search_result = _find_search_result_by_token(client, token)
-    assert search_result is not None
-    assert token in search_result.content or token in search_result.text_content
+    if search_result is None:
+        pytest.fail("Sent self-notes message could not be found via CLI search.")
 
-    print("live: applying reaction", flush=True)
-    _call_with_timeout(20, "add reaction", client.add_reaction, str(message.display_num), "like")
-    print("live: removing reaction", flush=True)
-    _call_with_timeout(20, "remove reaction", client.remove_reaction, str(message.display_num), "like")
+    msg_num = str(search_result["display_num"])
+    assert token in search_result.get("content", "") or token in search_result.get("text_content", "")
 
-    print("live: reading message detail", flush=True)
-    detail = _call_with_timeout(20, "message detail read", client.get_message_detail, str(message.display_num))
-    assert token in detail.content or token in detail.text_content
+    print("live: reading message detail through CLI", flush=True)
+    read_result = _run_cli("read", msg_num, "--json")
+    assert read_result.returncode == 0, read_result.stderr
+    read_payload = _parse_json_stdout(read_result)
+    assert read_payload is not None
+    detail = read_payload["data"]
+    assert token in detail.get("content", "") or token in detail.get("text_content", "")
+
+    print("live: applying reaction through CLI", flush=True)
+    react_result = _run_cli("react", "like", msg_num, "-y")
+    assert react_result.returncode == 0, react_result.stderr
+
+    print("live: removing reaction through CLI", flush=True)
+    unreact_result = _run_cli("unreact", "like", msg_num, "-y")
+    assert unreact_result.returncode == 0, unreact_result.stderr
 
 
 def test_live_cli_surface_and_known_limits():
