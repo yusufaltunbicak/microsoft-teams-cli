@@ -485,20 +485,15 @@ def test_get_client_caches_constructed_client(mocker):
 def test_get_client_exits_cleanly_when_token_lookup_fails(mocker):
     commands_common._client_cache.clear()
     mocker.patch.object(commands_common, "get_tokens", side_effect=RuntimeError("login first"))
-    print_error = mocker.patch.object(commands_common, "print_error")
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(commands_common.AuthRequiredError, match="login first"):
         commands_common._get_client()
-
-    print_error.assert_called_once_with("login first")
 
 
 def test_handle_api_error_relogs_and_retries_successfully(mocker):
     calls = {"count": 0}
     commands_common._client_cache["c"] = object()
     do_login = mocker.patch.object(commands_common, "do_login", return_value={})
-    print_error = mocker.patch.object(commands_common, "print_error")
-    print_success = mocker.patch.object(commands_common, "print_success")
 
     @commands_common._handle_api_error
     def flaky():
@@ -510,8 +505,6 @@ def test_handle_api_error_relogs_and_retries_successfully(mocker):
     assert flaky() == "ok"
     assert calls["count"] == 2
     do_login.assert_called_once_with()
-    print_error.assert_called_once()
-    print_success.assert_called_once()
     assert commands_common._client_cache == {}
 
 
@@ -523,27 +516,20 @@ def test_handle_api_error_relogs_and_retries_successfully(mocker):
     ],
 )
 def test_handle_api_error_exits_on_non_retryable_errors(mocker, exc: Exception, expected: str):
-    print_error = mocker.patch.object(commands_common, "print_error")
-
     @commands_common._handle_api_error
     def broken():
         raise exc
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(type(exc), match=str(exc)):
         broken()
-
-    print_error.assert_called_once_with(expected)
 
 
 def test_handle_api_error_exits_when_relogin_fails(mocker):
     mocker.patch.object(commands_common, "do_login", side_effect=RuntimeError("still expired"))
-    print_error = mocker.patch.object(commands_common, "print_error")
 
     @commands_common._handle_api_error
     def broken():
         raise TokenExpiredError()
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(commands_common.AuthRequiredError, match="Auto re-login failed. Run: teams login --force"):
         broken()
-
-    assert print_error.call_args_list[-1].args[0] == "Auto re-login failed. Run: teams login --force"

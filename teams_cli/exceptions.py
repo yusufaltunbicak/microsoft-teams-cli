@@ -45,3 +45,17 @@ class ApiError(TeamsCliError):
     def __init__(self, message: str = "API error", status_code: int = 0):
         self.status_code = status_code
         super().__init__(message, code="api_error")
+
+
+class RetryableError(TeamsCliError):
+    """Transient upstream or network failure that can be retried."""
+
+    def __init__(self, message: str = "Retryable upstream error"):
+        super().__init__(message, code="retryable")
+
+
+class ConfigurationError(TeamsCliError):
+    """Local config/cache/auth bundle problem."""
+
+    def __init__(self, message: str = "Configuration error"):
+        super().__init__(message, code="config_error")

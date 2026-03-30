@@ -2,22 +2,65 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 
 import click
+import httpx
+import yaml
 
 from ..auth import get_tokens, login as do_login, _decode_exp
 from ..client import TeamsClient
 from ..config import load_config
-from ..exceptions import TokenExpiredError
+from ..exceptions import (
+    ApiError,
+    AuthRequiredError,
+    ConfigurationError,
+    RateLimitError,
+    ResourceNotFoundError,
+    RetryableError,
+    TokenExpiredError,
+)
 from ..formatter import console, print_error, print_success
-from ..serialization import is_piped
-
-cfg = load_config()
+from ..serialization import is_piped, to_json
 
 _client_cache: dict[str, TeamsClient] = {}
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    dry_run: bool = False
+    no_input: bool = False
+    force: bool = False
+
+
+class _ConfigProxy(dict):
+    """Load config lazily so CLI wrappers can classify config errors."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self.clear()
+        self.update(load_config())
+        self._loaded = True
+
+    def __getitem__(self, key):
+        self._ensure_loaded()
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._ensure_loaded()
+        return super().get(key, default)
+
+
+cfg = _ConfigProxy()
 
 
 def _check_token_expiry(tokens: dict[str, str]) -> dict[str, str]:
@@ -35,9 +78,8 @@ def _check_token_expiry(tokens: dict[str, str]) -> dict[str, str]:
         try:
             tokens = do_login()
             print_success("Re-login successful.")
-        except Exception:
-            print_error("Auto re-login failed. Run: teams login --force")
-            sys.exit(1)
+        except Exception as exc:
+            raise AuthRequiredError("Auto re-login failed. Run: teams login --force") from exc
     return tokens
 
 
@@ -45,9 +87,8 @@ def _get_client() -> TeamsClient:
     if "c" not in _client_cache:
         try:
             tokens = get_tokens()
-        except RuntimeError as e:
-            print_error(str(e))
-            sys.exit(1)
+        except RuntimeError as exc:
+            raise AuthRequiredError(str(exc)) from exc
         tokens = _check_token_expiry(tokens)
         _client_cache["c"] = TeamsClient(tokens)
     return _client_cache["c"]
@@ -61,22 +102,35 @@ def _handle_api_error(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except click.ClickException:
+            raise
         except TokenExpiredError:
-            print_error("Token expired. Attempting re-login...")
             try:
                 do_login()
-                print_success("Re-login successful. Retrying...")
                 _client_cache.clear()
                 return fn(*args, **kwargs)
-            except Exception:
-                print_error("Auto re-login failed. Run: teams login --force")
-                sys.exit(1)
-        except ValueError as e:
-            print_error(str(e))
-            sys.exit(1)
-        except Exception as e:
-            print_error(f"Error: {e}")
-            sys.exit(1)
+            except Exception as exc:
+                raise AuthRequiredError("Auto re-login failed. Run: teams login --force") from exc
+        except RateLimitError:
+            raise
+        except ResourceNotFoundError:
+            raise
+        except (AuthRequiredError, RetryableError, ConfigurationError):
+            raise
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            raise ApiError(str(exc), status_code=status_code) from exc
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise RetryableError(str(exc)) from exc
+        except (json.JSONDecodeError, OSError, yaml.YAMLError) as exc:
+            raise ConfigurationError(str(exc)) from exc
+        except ValueError as exc:
+            classified = _classify_value_error(exc)
+            if classified is not exc:
+                raise classified from exc
+            raise
+        except Exception:
+            raise
 
     return wrapper
 
@@ -134,3 +188,83 @@ VALID_REACTIONS = {"like", "heart", "laugh", "surprised", "sad", "angry"}
 def should_json(as_json: bool) -> bool:
     """Return True if output should be JSON (explicit flag or piped stdout)."""
     return as_json or is_piped()
+
+
+def get_runtime_options() -> RuntimeOptions:
+    """Return the root runtime flags for the current CLI invocation."""
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return RuntimeOptions()
+
+    # Avoid importing teams_cli.cli at module import time to prevent circular imports.
+    from ..cli import RuntimeOptions as RootRuntimeOptions
+
+    opts = ctx.find_object(RootRuntimeOptions)
+    if opts is None:
+        return RuntimeOptions()
+    return RuntimeOptions(
+        dry_run=opts.dry_run,
+        no_input=opts.no_input,
+        force=opts.force,
+    )
+
+
+def should_skip_confirmation(local_force: bool = False) -> bool:
+    """Return True when confirmation prompts should be bypassed."""
+    opts = get_runtime_options()
+    return local_force or opts.force
+
+
+def ensure_interactive_allowed(action: str, local_force: bool = False) -> None:
+    """Fail fast when a command would need interactive input under --no-input."""
+    if should_skip_confirmation(local_force):
+        return
+
+    if get_runtime_options().no_input:
+        raise click.UsageError(
+            f"Refusing to {action} without confirmation (--no-input set; use --force or --yes)."
+        )
+
+
+def require_confirmation(prompt: str, action: str, local_force: bool = False) -> None:
+    """Confirm a mutation, or refuse if --no-input was requested."""
+    ensure_interactive_allowed(action, local_force=local_force)
+
+    click.confirm(prompt, abort=True)
+
+
+def emit_dry_run(op: str, request: dict, as_json: bool = False) -> bool:
+    """Emit a dry-run summary and stop command execution when --dry-run is enabled."""
+    if not get_runtime_options().dry_run:
+        return False
+
+    payload = {
+        "dry_run": True,
+        "op": op,
+        "request": request,
+    }
+    if should_json(as_json):
+        click.echo(to_json(payload))
+    else:
+        console.print(f"[yellow]Dry run:[/yellow] would {op}")
+        for key, value in request.items():
+            if value in (None, "", [], {}):
+                continue
+            if isinstance(value, list):
+                rendered = ", ".join(str(item) for item in value)
+            else:
+                rendered = str(value)
+            console.print(f"  [bold]{key}:[/bold] {rendered}")
+    return True
+
+
+def _classify_value_error(exc: ValueError):
+    message = str(exc)
+    if (
+        message.startswith("Unknown chat #")
+        or message.startswith("Unknown message #")
+        or message.startswith("Message #")
+        or message.startswith("File not found:")
+    ):
+        return ResourceNotFoundError(message)
+    return exc

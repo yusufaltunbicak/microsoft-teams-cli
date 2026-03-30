@@ -196,8 +196,8 @@ def test_auth_login_reports_verification_failure(runner, console_capture, mocker
 
     result = runner.invoke(cli_mod.cli, ["login"])
 
-    assert result.exit_code == 0
-    assert "Login completed but token verification failed." in console_capture.getvalue()
+    assert result.exit_code == 1
+    assert "Login completed but token verification failed." in result.output
 
 
 def test_auth_login_runtime_error_exits(runner, console_capture, mocker):
@@ -206,7 +206,7 @@ def test_auth_login_runtime_error_exits(runner, console_capture, mocker):
     result = runner.invoke(cli_mod.cli, ["login"])
 
     assert result.exit_code == 1
-    assert "no browser" in console_capture.getvalue()
+    assert "no browser" in result.output
 
 
 def test_whoami_non_json_uses_formatter(runner, mocker):
@@ -263,5 +263,5 @@ def test_set_status_invalid_expiry_exits_with_error(runner, console_capture, moc
 
     result = runner.invoke(cli_mod.cli, ["set-status", "Busy", "--expiry", "never", "-y"])
 
-    assert result.exit_code == 1
-    assert "Error: bad time" in console_capture.getvalue()
+    assert result.exit_code == 2
+    assert "bad time" in result.output

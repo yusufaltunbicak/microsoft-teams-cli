@@ -48,7 +48,7 @@ Repository = "https://github.com/yusufaltunbicak/microsoft-teams-cli"
 Issues = "https://github.com/yusufaltunbicak/microsoft-teams-cli/issues"
 
 [project.scripts]
-teams = "teams_cli.cli:cli"
+teams = "teams_cli.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["teams_cli"]
