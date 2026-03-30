@@ -8,7 +8,15 @@ import click
 
 from ..formatter import console, print_error, print_status, print_success
 from ..serialization import to_json
-from ._common import _get_client, _handle_api_error, _parse_schedule_time, should_json
+from ._common import (
+    _get_client,
+    _handle_api_error,
+    _parse_schedule_time,
+    emit_dry_run,
+    require_confirmation,
+    should_json,
+    should_skip_confirmation,
+)
 
 
 def register(cli: click.Group) -> None:
@@ -22,14 +30,11 @@ def register(cli: click.Group) -> None:
 def status(as_json: bool):
     """Show current presence status."""
     client = _get_client()
-    try:
-        resp = client.get_presence()
-        if should_json(as_json):
-            click.echo(to_json(resp))
-        else:
-            print_status(resp)
-    except Exception as e:
-        print_error(f"Could not get presence: {e}")
+    resp = client.get_presence()
+    if should_json(as_json):
+        click.echo(to_json(resp))
+    else:
+        print_status(resp)
 
 
 # Map CLI-friendly names to UPS API values
@@ -52,11 +57,17 @@ _STATUS_MAP = {
 @_handle_api_error
 def set_status(availability: str, expiry: str | None, yes: bool):
     """Set presence status via Teams UPS API (same as Teams web client)."""
-    if not yes:
+    if emit_dry_run(
+        "set status",
+        {"availability": availability, "expiry": expiry},
+    ):
+        return
+
+    if not should_skip_confirmation(yes):
         console.print(f"  [bold]Status:[/bold] {availability}")
         if expiry:
             console.print(f"  [bold]Expiry:[/bold] {expiry}")
-        click.confirm("Set this status?", abort=True)
+        require_confirmation("Set this status?", "set status", local_force=yes)
 
     client = _get_client()
 
@@ -67,8 +78,5 @@ def set_status(availability: str, expiry: str | None, yes: bool):
         dt = _parse_schedule_time(expiry)
         payload["desiredExpirationTime"] = dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    try:
-        client._ups_put("/me/forceavailability/", payload)
-        print_success(f"Status set to {availability}")
-    except Exception as e:
-        print_error(f"Could not set status: {e}")
+    client._ups_put("/me/forceavailability/", payload)
+    print_success(f"Status set to {availability}")

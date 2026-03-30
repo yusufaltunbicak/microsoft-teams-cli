@@ -5,7 +5,13 @@ from __future__ import annotations
 import click
 
 from ..formatter import print_error, print_success
-from ._common import _get_client, _handle_api_error
+from ._common import (
+    _get_client,
+    _handle_api_error,
+    emit_dry_run,
+    require_confirmation,
+    should_skip_confirmation,
+)
 
 
 def register(cli: click.Group) -> None:
@@ -32,14 +38,24 @@ def mark_read(nums: tuple[str, ...], is_chat: bool, unread: bool, yes: bool):
     kind = "chat" if is_chat else "message"
 
     if is_chat and unread:
-        print_error("--unread with --chat is not supported. Use message numbers for --unread.")
+        raise click.UsageError("--unread with --chat is not supported. Use message numbers for --unread.")
+
+    if emit_dry_run(
+        "mark read state",
+        {"kind": kind, "action": action, "ids": [f"#{n}" for n in items]},
+    ):
         return
 
-    if not yes:
+    if not should_skip_confirmation(yes):
         ids_str = ", ".join(f"#{n}" for n in items)
-        click.confirm(f"Mark {kind}s {ids_str} as {action}?", abort=True)
+        require_confirmation(
+            f"Mark {kind}s {ids_str} as {action}?",
+            f"mark {kind}s as {action}",
+            local_force=yes,
+        )
 
     client = _get_client()
+    failures: list[Exception] = []
     for n in items:
         try:
             if is_chat:
@@ -53,3 +69,7 @@ def mark_read(nums: tuple[str, ...], is_chat: bool, unread: bool, yes: bool):
                 print_success(f"Marked message #{n} as {action}")
         except Exception as e:
             print_error(f"Failed to mark {kind} #{n} as {action}: {e}")
+            failures.append(e)
+
+    if failures:
+        raise failures[0]
