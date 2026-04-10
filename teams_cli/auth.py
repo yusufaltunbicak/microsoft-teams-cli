@@ -207,8 +207,8 @@ def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
             const key = localStorage.key(i);
             const val = localStorage.getItem(key);
 
-            // MSAL access tokens
-            if (key.includes('-accesstoken-')) {
+            // MSAL access tokens (v1 uses hyphens: "-accesstoken-", v2 uses pipes: "|accesstoken|")
+            if (key.includes('-accesstoken-') || key.includes('|accesstoken|')) {
                 try {
                     const obj = JSON.parse(val);
                     const secret = obj.secret || '';
