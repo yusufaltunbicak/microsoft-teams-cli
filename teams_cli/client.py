@@ -6,10 +6,11 @@ import os
 import random
 import secrets
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import escape
 from pathlib import Path
@@ -35,12 +36,14 @@ from .constants import (
 )
 from .exceptions import (
     ApiError,
+    AuthRequiredError,
     RateLimitError,
     ResourceNotFoundError,
     RetryableError,
     TokenExpiredError,
 )
 from .models import Attachment, Chat, Message, User
+from .metadata_cache import MetadataCache
 
 
 class TeamsClient:
@@ -72,7 +75,11 @@ class TeamsClient:
         # Anti-detection session
         from .config import load_config
         _cfg = load_config()
-        self._session = BrowserSession(timeout=_cfg.get("timeout", 30))
+        self._session = BrowserSession(
+            timeout=_cfg.get("timeout", 30),
+            read_jitter_base=_cfg.get("jitter", {}).get("read_base", 0.3),
+            write_jitter_base=_cfg.get("jitter", {}).get("write_base", 2.0),
+        )
         self._circuit_breaker = _CircuitBreaker(
             threshold=self.CIRCUIT_BREAKER_THRESHOLD,
             reset_seconds=self.CIRCUIT_BREAKER_RESET_SECONDS,
@@ -80,6 +87,18 @@ class TeamsClient:
 
         # Cache for user display name lookups (user_id -> display_name)
         self._user_name_cache: dict[str, str] = {}
+        self._sender_email_cache: dict[str, str] = {}
+        self._metadata = MetadataCache(
+            CACHE_DIR,
+            f"{self._get_tenant_id()}:{self._user_id}:{self._region}",
+            enabled=_cfg.get("cache", {}).get("metadata", True),
+        )
+        # A single command (notably summary) may ask for the same list twice.
+        # Coalesce those reads without retaining conversation previews on disk.
+        self._conversations_lock = threading.RLock()
+        self._conversations_snapshot: list[dict] = []
+        self._conversations_snapshot_at = 0.0
+        self._conversations_snapshot_size = 0
 
         # ID mapping: two-level (chats and messages)
         self._id_map: dict = self._load_id_map()
@@ -141,18 +160,10 @@ class TeamsClient:
     # Chats
     # ------------------------------------------------------------------
 
-    def get_chats(self, top: int = 25, unread_only: bool = False, skip: int = 0) -> list[Chat]:
+    def get_chats(self, top: int = 25, unread_only: bool = False, skip: int = 0, refresh: bool = False) -> list[Chat]:
         """Get recent conversations from IC3 Chat Service."""
-        # Always fetch max from API, filter client-side
         fetch_size = max((top + skip) * 2, 200)
-        params = {
-            "view": "msnp24Equivalent",
-            "pageSize": fetch_size,
-            "startTime": "0",
-            "targetType": "Passport|Skype|Lync|Thread|NotificationStream|cnsContact",
-        }
-        resp = self._ic3_get("/users/ME/conversations", params=params)
-        conversations = resp.get("conversations", [])
+        conversations = self._get_conversations(fetch_size, refresh=refresh)
 
         chats = []
         for conv in conversations:
@@ -173,9 +184,53 @@ class TeamsClient:
 
         # Resolve display names for 1:1 chats that have no members
         self._resolve_1on1_chat_names(chats)
+        self._cache_chat_metadata(chats)
 
         self._assign_chat_nums(chats)
         return chats
+
+    def _get_conversations(self, fetch_size: int = 200, refresh: bool = False) -> list[dict]:
+        with self._conversations_lock:
+            if (not refresh and self._conversations_snapshot_size >= fetch_size
+                    and time.monotonic() - self._conversations_snapshot_at < 5):
+                return self._conversations_snapshot
+            params = {
+                "view": "msnp24Equivalent",
+                "pageSize": fetch_size,
+                "startTime": "0",
+                "targetType": "Passport|Skype|Lync|Thread|NotificationStream|cnsContact",
+            }
+            resp = self._ic3_get("/users/ME/conversations", params=params)
+            conversations = resp.get("conversations", [])
+            names: dict[str, dict] = {}
+            chats: list[Chat] = []
+            for conv in conversations:
+                chat = Chat.from_api(conv, my_user_id=self._user_id)
+                chats.append(chat)
+                # The web list already includes the last sender's verified name.
+                last = conv.get("lastMessage", {})
+                sender_id = last.get("from", "").removeprefix("8:orgid:")
+                name = last.get("imdisplayname", "")
+                if sender_id and name:
+                    names[sender_id] = {"display_name": name}
+                    self._user_name_cache[sender_id] = name
+            self._metadata.put_many("users", names)
+            self._cache_chat_metadata(chats)
+            self._conversations_snapshot = conversations
+            self._conversations_snapshot_size = fetch_size
+            self._conversations_snapshot_at = time.monotonic()
+            return conversations
+
+    def _cache_chat_metadata(self, chats: list[Chat]) -> None:
+        self._metadata.put_many("chats", {
+            chat.id: {
+                "title": chat.display_title,
+                "topic": chat.topic,
+                "members": chat.members,
+                "chat_type": chat.chat_type,
+            }
+            for chat in chats if chat.id and (chat.topic or chat.members)
+        })
 
     def _resolve_1on1_chat_names(self, chats: list[Chat]) -> None:
         """Resolve display names for 1:1 chats that show as '1:1 Chat'.
@@ -183,6 +238,7 @@ class TeamsClient:
         For 1:1 chats, the conv_id has format 19:{userId1}_{userId2}@unq.gbl.spaces.
         We extract the other user's ID and look up their display name via Graph.
         """
+        pending: dict[str, str] = {}
         for chat in chats:
             # Skip if chat already has members or a topic
             if chat.topic or chat.members:
@@ -199,13 +255,16 @@ class TeamsClient:
                 if not other_ids:
                     continue
                 other_id = other_ids[0]
-                name = self._resolve_user_name(other_id)
-                # Only set if we got a real name (not just the ID back)
-                if name and name != other_id:
-                    chat.members.append(name)
-            except (httpx.HTTPStatusError, TokenExpiredError, ValueError, KeyError):
+                pending[chat.id] = other_id
+            except (ValueError, KeyError):
                 # If anything fails, leave it as "1:1 Chat"
                 continue
+        names = self._resolve_user_names(list(pending.values()))
+        for chat in chats:
+            other_id = pending.get(chat.id, "")
+            name = names.get(other_id, "")
+            if name and name != other_id:
+                chat.members.append(name)
 
     def get_chat_messages(
         self,
@@ -259,23 +318,45 @@ class TeamsClient:
         conv_id = msg_info["conv"]
         msg_id = msg_info["msg"]
 
-        # Fetch the conversation messages and find the one
-        params = {
-            "view": "msnp24Equivalent|supportsMessageProperties",
-            "pageSize": 50,
-        }
-        resp = self._ic3_get(
-            f"/users/ME/conversations/{conv_id}/messages",
-            params=params,
+        from urllib.parse import quote
+        raw = self._ic3_get(
+            f"/users/ME/conversations/{quote(conv_id, safe='')}/messages/{quote(str(msg_id), safe='')}",
+            params={"view": "msnp24Equivalent|supportsMessageProperties"},
         )
-        for m in resp.get("messages", []):
-            m_id = m.get("id", m.get("sequenceId", m.get("version", "")))
-            if str(m_id) == str(msg_id):
-                msg = Message.from_api(m, my_user_id=self._user_id)
-                msg.display_num = int(msg_num)
-                return msg
+        m_id = raw.get("id", raw.get("sequenceId", raw.get("version", "")))
+        if str(m_id) == str(msg_id):
+            raw.setdefault("conversationid", conv_id)
+            msg = Message.from_api(raw, my_user_id=self._user_id)
+            msg.display_num = int(msg_num.removeprefix("#"))
+            return msg
 
         raise ResourceNotFoundError(f"Message #{msg_num} not found. Try re-reading the chat.")
+
+    def get_message_context(self, msg_num: str, before: int = 2, after: int = 2) -> list[Message]:
+        """Fetch a bounded window around an old message with one anchored read."""
+        if not (0 <= before <= 50 and 0 <= after <= 50):
+            raise ValueError("Message context limits must be between 0 and 50")
+        info = self._resolve_message_id(msg_num)
+        from urllib.parse import quote
+        direction = "BIDIRECTIONAL" if before and after else "BACKWARD" if before else "FORWARD"
+        size = (2 * max(before, after) + 3) if before and after else max(before, after) + 2
+        response = self._ic3_get(
+            f"/users/ME/conversations/{quote(info['conv'], safe='')}/messages/epochTimeStamp/{quote(str(info['msg']), safe='')}",
+            params={"pageSize": size, "direction": direction, "includeMetadata": "true", "locationType": "Primary"},
+        )
+        messages = []
+        for raw in response.get("messages", []):
+            if raw.get("messagetype") in ("Text", "RichText/Html", "RichText"):
+                raw.setdefault("conversationid", info["conv"])
+                messages.append(Message.from_api(raw, my_user_id=self._user_id))
+        if not any(str(m.id) == str(info["msg"]) for m in messages):
+            messages.append(self.get_message_detail(msg_num))
+        messages.sort(key=lambda m: (m.timestamp, str(m.id)))
+        index = next(i for i, m in enumerate(messages) if str(m.id) == str(info["msg"]))
+        messages = messages[max(0, index - before):index + after + 1]
+        self._assign_message_nums(messages)
+        self._resolve_chat_titles(messages)
+        return messages
 
     # ------------------------------------------------------------------
     # Send messages
@@ -712,23 +793,29 @@ class TeamsClient:
     ) -> list[Message]:
         """Search messages across chats or within a specific chat."""
         fetch_size = top + offset
+        conv_id = self._resolve_chat_id(chat_num) if chat_num else None
         if self._substrate:
-            messages = self._substrate_search(query, fetch_size)
+            server_query = self._search_query(query, conv_id, from_filter, after, before)
+            messages = self._substrate_search(server_query, fetch_size)
         else:
             messages = self._mt_search_fallback(query, fetch_size, chat_num)
 
         # Client-side filtering
         if from_filter:
-            from_lower = from_filter.lower()
-            messages = [m for m in messages if from_lower in m.sender.lower()]
+            from_lower = from_filter.removeprefix("8:orgid:").casefold()
+            messages = [m for m in messages if from_lower in m.sender.casefold()
+                        or from_lower == m.sender_id.casefold()
+                        or from_lower == self._sender_email_cache.get(m.sender_id, "").casefold()]
         if after:
             after_dt = self._parse_date_filter(after)
             messages = [m for m in messages if m.timestamp >= after_dt]
         if before:
             before_dt = self._parse_date_filter(before)
-            messages = [m for m in messages if m.timestamp <= before_dt]
-        if chat_num:
-            conv_id = self._resolve_chat_id(chat_num)
+            if len(before) == 10:
+                messages = [m for m in messages if m.timestamp < before_dt + timedelta(days=1)]
+            else:
+                messages = [m for m in messages if m.timestamp <= before_dt]
+        if conv_id:
             messages = [m for m in messages if m.conversation_id == conv_id]
 
         if offset:
@@ -737,6 +824,37 @@ class TeamsClient:
         self._assign_message_nums(messages)
         self._resolve_chat_titles(messages)
         return messages
+
+    @staticmethod
+    def _search_query(query: str, conv_id: str | None = None, from_filter: str | None = None,
+                      after: str | None = None, before: str | None = None) -> str:
+        """Push supported filters into Teams' index before selecting the top hits."""
+        def quoted(value: str) -> str:
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        terms = []
+        if conv_id:
+            terms.append(f"ClientThreadId:{quoted(conv_id)}")
+        if from_filter:
+            uid = from_filter.removeprefix("8:orgid:")
+            try:
+                uuid.UUID(uid)
+            except ValueError:
+                terms.append(f"from:{quoted(from_filter)}")
+            else:
+                terms.append("Extension_SkypeSpaces_ConversationPost_Extension_FromSkypeInternalId_String:"
+                             + quoted(f"8:orgid:{uid}"))
+        if after:
+            date = TeamsClient._parse_date_filter(after).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            terms.append(f"sent>={quoted(date)}")
+        if before:
+            date = TeamsClient._parse_date_filter(before)
+            operator = "<="
+            if len(before) == 10:
+                date += timedelta(days=1)
+                operator = "<"
+            value = date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            terms.append(f"sent{operator}{quoted(value)}")
+        return f"({query}) AND " + " AND ".join(terms) if terms else query
 
     def _substrate_search(self, query: str, top: int) -> list[Message]:
         """Search via Substrate Search API (same API Teams web uses)."""
@@ -782,20 +900,34 @@ class TeamsClient:
             "x-anchormailbox": f"Oid:{self._user_id}@{tenant_id}",
             "client-request-id": str(uuid.uuid4()),
         }
-        resp = self._session.client.post(
-            SUBSTRATE_SEARCH_BASE, headers=headers, json=payload, timeout=30,
+        data = self._request_with_retry(
+            "POST", SUBSTRATE_SEARCH_BASE, headers=headers, json_data=payload,
+            safe_read=True,
         )
-        data = resp.json()
 
         messages = []
+        seen: set[tuple[str, str]] = set()
         for entity_set in data.get("EntitySets", []):
             for result_set in entity_set.get("ResultSets", []):
                 if result_set.get("ContentSources") != ["Teams"]:
                     continue
                 for result in result_set.get("Results", []):
                     msg = self._parse_substrate_result(result)
-                    if msg:
+                    if msg and (msg.conversation_id, str(msg.id)) not in seen:
+                        seen.add((msg.conversation_id, str(msg.id)))
                         messages.append(msg)
+        names = self._resolve_user_names([m.sender_id for m in messages if m.sender == m.sender_id])
+        for msg in messages:
+            if msg.sender == msg.sender_id:
+                msg.sender = names.get(msg.sender_id, msg.sender_id)
+        self._metadata.put_many("users", {
+            msg.sender_id: {"display_name": msg.sender}
+            for msg in messages if msg.sender_id and msg.sender and msg.sender != msg.sender_id
+        })
+        self._metadata.put_many("chats", {
+            msg.conversation_id: {"title": msg.chat_title, "topic": msg.chat_title}
+            for msg in messages if msg.conversation_id and msg.chat_title
+        })
         return messages
 
     def _parse_substrate_result(self, result: dict) -> Message | None:
@@ -807,6 +939,9 @@ class TeamsClient:
             "SkypeSpaces_ConversationPost_Extension_FromSkypeInternalId", ""
         )
         sender_id = sender_mri.split("8:orgid:")[-1] if "8:orgid:" in sender_mri else sender_mri
+        sender_address = source.get("Sender", {}).get("EmailAddress", {}).get("Address", "")
+        if sender_id and sender_address:
+            self._sender_email_cache[sender_id] = sender_address
 
         thread_id = source.get("ClientThreadId", "")
         message_id = source.get("InternetMessageId", "")
@@ -838,9 +973,12 @@ class TeamsClient:
         is_from_me = sender_id == self._user_id
 
         # Resolve sender display name from cached user lookups
-        sender_name = source.get("DisplayTo", "") if is_from_me else ""
+        sender_name = source.get("Sender", {}).get("EmailAddress", {}).get("Name", "")
+        if not sender_name and is_from_me:
+            sender_name = self._display_name
         if not sender_name:
-            sender_name = self._resolve_user_name(sender_id)
+            cached = self._metadata.get("users", sender_id) or {}
+            sender_name = self._user_name_cache.get(sender_id) or cached.get("display_name") or sender_id
 
         from .models import _parse_dt, _strip_html
 
@@ -855,23 +993,52 @@ class TeamsClient:
             is_from_me=is_from_me,
             text_content=_strip_html(preview),
             attachments=attachments,
+            chat_title=source.get("ConversationTopic", "") or "",
         )
         return msg
 
     def _resolve_user_name(self, user_id: str) -> str:
         """Try to resolve a user ID to a display name via Graph (cached)."""
-        if not user_id:
-            return ""
-        if user_id in self._user_name_cache:
-            return self._user_name_cache[user_id]
-        try:
-            data = self._graph_get(f"/users/{user_id}")
-            name = data.get("displayName", user_id)
-            self._user_name_cache[user_id] = name
-            return name
-        except (httpx.HTTPStatusError, TokenExpiredError, RateLimitError, KeyError):
-            self._user_name_cache[user_id] = user_id
-            return user_id
+        return self._resolve_user_names([user_id]).get(user_id, user_id)
+
+    def _resolve_user_names(self, user_ids: list[str]) -> dict[str, str]:
+        """Resolve only missing names, in Graph batches of at most 20 reads."""
+        names: dict[str, str] = {}
+        missing: list[str] = []
+        for uid in dict.fromkeys(uid for uid in user_ids if uid):
+            entry = self._metadata.get("users", uid) or {}
+            name = self._user_name_cache.get(uid) or entry.get("display_name")
+            if name:
+                names[uid] = name
+            else:
+                missing.append(uid)
+        resolved: dict[str, dict] = {}
+        from urllib.parse import quote
+        for start in range(0, len(missing), 20):
+            chunk = missing[start:start + 20]
+            try:
+                if len(chunk) == 1:
+                    uid = chunk[0]
+                    body = self._graph_get(f"/users/{quote(uid, safe='')}", params={"$select": "id,displayName"})
+                    responses = {uid: body}
+                else:
+                    responses = self._graph_batch_get({
+                        uid: f"/users/{quote(uid, safe='')}?$select=id,displayName"
+                        for uid in chunk
+                    })
+                for uid, body in responses.items():
+                    name = body.get("displayName", "")
+                    if name:
+                        names[uid] = name
+                        resolved[uid] = {"display_name": name}
+            except (httpx.HTTPStatusError, AuthRequiredError, TokenExpiredError, RateLimitError, RetryableError, KeyError):
+                # Name enrichment must not discard otherwise valid messages.
+                pass
+        self._metadata.put_many("users", resolved)
+        for uid in missing:
+            names.setdefault(uid, uid)
+        self._user_name_cache.update(names)
+        return names
 
     def _mt_search_fallback(
         self, query: str, top: int, chat_num: str | None,
@@ -884,6 +1051,7 @@ class TeamsClient:
 
         # No substrate token and no specific chat — scan recent chats
         chats = self.get_chats(top=10)
+        self._cache_chat_metadata(chats)
         results: list[Message] = []
         query_lower = query.lower()
         for chat in chats:
@@ -1229,6 +1397,7 @@ class TeamsClient:
         return emails
 
     def _resolve_chat_id(self, display_id: str) -> str:
+        display_id = display_id.removeprefix("#")
         self._refresh_id_map_entry("chats", display_id)
         if display_id in self._id_map["chats"]:
             return self._id_map["chats"][display_id]
@@ -1239,11 +1408,45 @@ class TeamsClient:
             or len(display_id) > 50
         ):
             return display_id
+        if not display_id.isdigit():
+            conv_id = self.find_chat(display_id)
+            if conv_id:
+                return conv_id
         raise ResourceNotFoundError(
             f"Unknown chat #{display_id}. Run 'teams chats' first to populate the ID map."
         )
 
+    def find_chat(self, name: str, refresh: bool = False) -> str | None:
+        """Resolve an exact or unambiguous partial title without creating a chat."""
+        def matches() -> tuple[list[str], list[str]]:
+            q = name.casefold().strip()
+            entries = self._metadata.items("chats")
+            exact = [cid for cid, value in entries.items() if value.get("title", "").casefold() == q]
+            partial = [cid for cid, value in entries.items() if q in value.get("title", "").casefold()]
+            return exact, partial
+
+        if not refresh:
+            exact, partial = matches()
+            if len(exact) == 1:
+                return exact[0]
+        # Freshen the bounded recent list before accepting partial matches.
+        chats = self.get_chats(top=200, refresh=refresh)
+        exact, partial = matches()
+        candidates = exact or partial
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            titles = self._metadata.items("chats")
+            numbered = {chat.id: chat.display_num for chat in chats}
+            options = ", ".join(
+                f"#{numbered[cid]} {titles[cid]['title']}" if cid in numbered else titles[cid]["title"]
+                for cid in candidates[:5]
+            )
+            raise ResourceNotFoundError(f"Chat name is ambiguous: {options}. Use a chat number or full ID.")
+        return None
+
     def _resolve_message_id(self, display_id: str) -> dict:
+        display_id = display_id.removeprefix("#")
         self._refresh_id_map_entry("messages", display_id)
         if display_id in self._id_map["messages"]:
             return self._id_map["messages"][display_id]
@@ -1269,13 +1472,14 @@ class TeamsClient:
                 default=0,
             ) + 1
             existing_by_message = {
-                str(value.get("msg")): int(key)
+                (value.get("conv", ""), str(value.get("msg"))): int(key)
                 for key, value in msg_map.items()
                 if key.isdigit() and isinstance(value, dict) and value.get("msg")
             }
 
             for msg in messages:
-                existing_num = existing_by_message.get(str(msg.id))
+                identity = (msg.conversation_id, str(msg.id))
+                existing_num = existing_by_message.get(identity)
                 if existing_num is not None:
                     msg.display_num = existing_num
                     continue
@@ -1285,7 +1489,7 @@ class TeamsClient:
                     "conv": msg.conversation_id,
                     "msg": msg.id,
                 }
-                existing_by_message[str(msg.id)] = next_msg_num
+                existing_by_message[identity] = next_msg_num
                 next_msg_num += 1
 
             self._evict_old_entries_from_map(id_map, "messages")
@@ -1294,33 +1498,41 @@ class TeamsClient:
 
     def _resolve_chat_titles(self, messages: list[Message]) -> None:
         """Resolve conversation IDs to chat titles for search results."""
-        # Build a reverse map: conv_id -> chat_num from the id_map
-        conv_to_num: dict[str, str] = {}
-        for num, conv_id in self._id_map.get("chats", {}).items():
-            conv_to_num[conv_id] = num
-
-        # Check which conv_ids are unknown (not in id_map)
-        unknown_conv_ids: set[str] = set()
-        for msg in messages:
-            if msg.conversation_id and msg.conversation_id not in conv_to_num:
-                unknown_conv_ids.add(msg.conversation_id)
-
-        # If there are unknown conv_ids, fetch chats to populate the map
-        conv_to_title: dict[str, str] = {}
-        if unknown_conv_ids:
+        wanted = {m.conversation_id for m in messages if m.conversation_id}
+        if not wanted:
+            return
+        conv_to_title = {
+            cid: value["title"] for cid in wanted
+            if (value := self._metadata.get("chats", cid)) and value.get("title")
+        }
+        conv_to_title.update({m.conversation_id: m.chat_title for m in messages if m.chat_title})
+        missing = wanted - set(conv_to_title)
+        if missing:
             try:
-                chats = self.get_chats(top=100)
-                # Rebuild reverse map after get_chats populated new entries
-                conv_to_num = {}
-                for num, conv_id in self._id_map.get("chats", {}).items():
-                    conv_to_num[conv_id] = num
-                # Build conv_id -> display_title from fetched chats
-                for chat in chats:
-                    conv_to_title[chat.id] = chat.display_title
-            except (httpx.HTTPStatusError, TokenExpiredError, RateLimitError, ValueError):
+                # Resolve names for result conversations only, rather than every
+                # chat in the account. Reuse an earlier list response when possible.
+                conversations = self._get_conversations()
+                chats = [Chat.from_api(conv, my_user_id=self._user_id)
+                         for conv in conversations if conv.get("id") in missing]
+                self._resolve_1on1_chat_names(chats)
+                self._cache_chat_metadata(chats)
+                conv_to_title.update({chat.id: chat.display_title for chat in chats})
+            except (httpx.HTTPStatusError, AuthRequiredError, TokenExpiredError, RateLimitError, RetryableError, ValueError):
                 pass
 
-        # Assign chat_title to each message
+        # Enrichment must not renumber a previously displayed chat list.
+        def update(id_map: dict) -> None:
+            chat_map = id_map.setdefault("chats", {})
+            existing = set(chat_map.values())
+            next_num = max((int(k) for k in chat_map if k.isdigit()), default=0) + 1
+            for cid in sorted(wanted):
+                if cid not in existing:
+                    chat_map[str(next_num)] = cid
+                    existing.add(cid)
+                    next_num += 1
+            self._evict_old_entries_from_map(id_map, "chats")
+        self._update_id_map(update)
+        conv_to_num = {cid: num for num, cid in self._id_map["chats"].items()}
         for msg in messages:
             if not msg.conversation_id:
                 continue
@@ -1442,6 +1654,7 @@ class TeamsClient:
         params: dict | None = None,
         json_data: dict | None = None,
         max_retries: int = 3,
+        safe_read: bool = False,
     ) -> dict:
         """Execute HTTP request with retry hardening for 429/5xx/network failures."""
         resp = self._request_raw_with_retry(
@@ -1451,6 +1664,7 @@ class TeamsClient:
             params=params,
             json_data=json_data,
             max_retries=max_retries,
+            safe_read=safe_read,
         )
         return self._handle_response(resp)
 
@@ -1462,11 +1676,20 @@ class TeamsClient:
         params: dict | None = None,
         json_data: dict | list | None = None,
         max_retries: int = 3,
+        safe_read: bool = False,
     ) -> httpx.Response:
         self._circuit_breaker.raise_if_open()
         retries_429 = 0
         retries_5xx = 0
         retries_network = 0
+        refreshed_auth = False
+        can_replay = method.upper() == "GET" or safe_read
+        headers = dict(headers)
+        resource = self._auth_resource(url)
+        if resource and self._tokens.get(resource):
+            from .auth import token_is_fresh
+            if not token_is_fresh(self._tokens, resource):
+                self._refresh_auth_headers(headers, resource, force=False)
 
         while True:
             try:
@@ -1475,7 +1698,7 @@ class TeamsClient:
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 self._circuit_breaker.record_failure()
-                if retries_network >= self.MAX_RETRIES_5XX:
+                if not can_replay or retries_network >= self.MAX_RETRIES_5XX:
                     raise RetryableError(str(exc)) from exc
                 retries_network += 1
                 time.sleep(1)
@@ -1484,6 +1707,11 @@ class TeamsClient:
             if resp.status_code < 400:
                 self._circuit_breaker.record_success()
                 return resp
+
+            if resp.status_code == 401 and can_replay and resource and not refreshed_auth:
+                self._refresh_auth_headers(headers, resource, force=True)
+                refreshed_auth = True
+                continue
 
             if resp.status_code == 429:
                 if retries_429 >= min(max_retries, self.MAX_RETRIES_429):
@@ -1495,13 +1723,38 @@ class TeamsClient:
 
             if resp.status_code >= 500:
                 self._circuit_breaker.record_failure()
-                if retries_5xx >= self.MAX_RETRIES_5XX:
+                if not can_replay or retries_5xx >= self.MAX_RETRIES_5XX:
                     return resp
                 retries_5xx += 1
                 time.sleep(1)
                 continue
 
             return resp
+
+    def _auth_resource(self, url: str) -> str | None:
+        """Route only known authenticated hosts; never refresh arbitrary URLs."""
+        if url.startswith(SUBSTRATE_SEARCH_BASE):
+            return "substrate"
+        if url.startswith(GRAPH_BASE.rsplit("/", 1)[0] + "/"):
+            return "graph" if self._graph else "ic3"
+        if url.startswith(self._ups + "/"):
+            return "presence"
+        if url.startswith(self._chatsvc + "/") or url.startswith(self._mt + "/"):
+            return "ic3"
+        return None
+
+    def _refresh_auth_headers(self, headers: dict, resource: str, *, force: bool) -> None:
+        from .auth import refresh_tokens
+        refreshed = refresh_tokens(self._tokens, required=(resource,), force=force)
+        self._tokens = refreshed
+        self._ic3 = refreshed.get("ic3", "")
+        self._graph = refreshed.get("graph", "")
+        self._presence_token = refreshed.get("presence", "")
+        self._substrate = refreshed.get("substrate", "")
+        for key in list(headers):
+            if key.lower() == "authorization":
+                headers[key] = "Bearer " + refreshed.get(resource, "")
+                break
 
     # ------------------------------------------------------------------
     # HTTP helpers — IC3 Chat Service
@@ -1569,7 +1822,7 @@ class TeamsClient:
         self._session.jitter(is_write=False)
         headers = self._session.browser_headers(self._presence_token)
         url = f"{self._ups}{path}"
-        return self._request_with_retry("POST", url, headers, json_data=json_data)
+        return self._request_with_retry("POST", url, headers, json_data=json_data, safe_read=True)
 
     def _ups_put(self, path: str, json_data: dict | None = None):
         self._session.jitter(is_write=True)
@@ -1580,6 +1833,45 @@ class TeamsClient:
     # ------------------------------------------------------------------
     # HTTP helpers — Graph
     # ------------------------------------------------------------------
+
+    def _graph_batch_get(self, paths: dict[str, str]) -> dict[str, dict]:
+        """GET-only batch transport; a POST envelope does not mutate Graph."""
+        if len(paths) > 20:
+            raise ValueError("Graph batches support at most 20 requests")
+        if not paths:
+            return {}
+        if any(not p.startswith("/") or p.startswith("//") or "://" in p for p in paths.values()):
+            raise ValueError("Graph batch paths must be relative")
+        pending = dict(paths)
+        results: dict[str, dict] = {}
+        for attempt in range(self.MAX_RETRIES_429 + 1):
+            self._session.jitter(is_write=False)
+            headers = self._session.browser_headers(self._graph or self._ic3)
+            data = self._request_with_retry("POST", f"{GRAPH_BASE}/$batch", headers, json_data={
+                "requests": [{"id": uid, "method": "GET", "url": path} for uid, path in pending.items()],
+            }, safe_read=True)
+            retry: dict[str, str] = {}
+            delay = 0.0
+            for response in data.get("responses", []):
+                uid = response.get("id", "")
+                if uid not in pending:
+                    continue
+                status = response.get("status", 0)
+                body = response.get("body", {})
+                if status == 200 and isinstance(body, dict):
+                    results[uid] = body
+                elif status == 429:
+                    retry[uid] = pending[uid]
+                    retry_headers = {k.lower(): str(v) for k, v in response.get("headers", {}).items()}
+                    delay = max(delay, self._parse_retry_after(retry_headers.get("retry-after", "")) or 2 ** attempt)
+            if not retry:
+                break
+            if attempt == self.MAX_RETRIES_429:
+                # Retain successful names, but do not persist failure placeholders.
+                break
+            time.sleep(delay)
+            pending = retry
+        return results
 
     def _graph_get(self, path: str, params: dict | None = None) -> dict:
         token = self._graph or self._ic3
