@@ -127,7 +127,7 @@ def test_browser_session_jitter_waits_for_minimum_gap(monkeypatch: pytest.Monkey
     session = anti_detection.BrowserSession()
     monkeypatch.setattr(anti_detection.random, "uniform", lambda _a, _b: 1.0)
     clock = iter([1.0, 2.0])
-    monkeypatch.setattr(anti_detection.time, "time", lambda: next(clock))
+    monkeypatch.setattr(anti_detection.time, "monotonic", lambda: next(clock))
     sleep = mocker.patch.object(anti_detection.time, "sleep")
 
     session.jitter(is_write=True)

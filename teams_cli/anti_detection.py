@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import random
 import time
+import threading
+import math
 
 import httpx
 
@@ -22,6 +24,9 @@ class BrowserSession:
         proxy: str | None = None,
         timeout: int | float = 30,
     ):
+        if any(not math.isfinite(v) or v < 0 for v in (read_jitter_base, write_jitter_base)):
+            raise ValueError("Jitter bases must be finite and non-negative.")
+        self._pacing_lock = threading.Lock()
         self._read_base = read_jitter_base
         self._write_base = write_jitter_base
         self._last_request_time: float = 0
@@ -51,11 +56,11 @@ class BrowserSession:
         delay = base * random.uniform(0.7, 1.5)
 
         # Ensure minimum gap between requests
-        elapsed = time.time() - self._last_request_time
-        if elapsed < delay:
-            time.sleep(delay - elapsed)
-
-        self._last_request_time = time.time()
+        with self._pacing_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            self._last_request_time = time.monotonic()
 
     def browser_headers(self, token: str, extra: dict | None = None) -> dict:
         """Build full browser-like headers for Teams API."""

@@ -1,0 +1,314 @@
+"""Private, account-scoped local message index. No network access on reads."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import unicodedata
+import httpx
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit, unquote
+
+from . import constants
+from .exceptions import AuthRequiredError, ConfigurationError, ResourceNotFoundError
+from .models import Message
+
+
+def normalize(value: str) -> str:
+    value = value.casefold().replace("ı", "i")
+    return "".join(c for c in unicodedata.normalize("NFD", value) if not unicodedata.combining(c))
+
+
+def account_key(tokens: dict) -> str:
+    from .msal_cache import claims
+    data = claims(tokens.get("ic3", "")) if isinstance(tokens, dict) else {}
+    uid = data.get("oid")
+    tenant = data.get("tid")
+    if not uid or not tenant:
+        raise AuthRequiredError("No saved account. Run: teams login")
+    return hashlib.sha256(f"{tenant}:{uid}".encode()).hexdigest()
+
+
+def saved_account() -> str:
+    """Identify a saved account even offline or after access-token expiry."""
+    return account_key(saved_tokens())
+
+
+def saved_tokens() -> dict:
+    """Read one account snapshot; this never renews credentials."""
+    env = os.environ.get("TEAMS_IC3_TOKEN")
+    if env:
+        return {"ic3": env}
+    try:
+        tokens = json.loads(constants.TOKENS_FILE.read_text())
+        account_key(tokens)
+        return tokens
+    except (OSError, ValueError, TypeError) as exc:
+        raise AuthRequiredError("No saved account for local search. Run: teams login") from exc
+
+
+def number_messages(messages: list[Message], tokens: dict | None = None) -> None:
+    """Reuse the existing locked ID-map writer without login or network calls."""
+    from .client import TeamsClient
+    tokens = tokens if tokens is not None else saved_tokens()
+    client = TeamsClient(tokens)
+    try:
+        client._assign_message_nums(messages)
+    finally:
+        client._session.close()
+
+
+class HistoryIndex:
+    def __init__(self, account: str, path: Path | None = None):
+        self.account = account
+        self.path = path or constants.CACHE_DIR / "history.sqlite3"
+        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # Create securely before sqlite opens it; rollback journal inherits 0600.
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        self.path.chmod(0o600)
+        self.db = sqlite3.connect(self.path, timeout=10)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA secure_delete=ON")
+        self._native_fts_delete = sqlite3.sqlite_version_info >= (3, 42, 0)
+        fts_config_exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='message_fts_config'").fetchone()
+        secure_delete = (self.db.execute("SELECT v FROM message_fts_config WHERE k='secure-delete'").fetchone()
+                         if fts_config_exists else None)
+        fts_delete_enabled = bool(secure_delete and secure_delete[0] in (1, "1"))
+        if not self._native_fts_delete:
+            if fts_delete_enabled:
+                self.db.close()
+                raise ConfigurationError(
+                    "This local index requires SQLite 3.42 or newer. Use a Python runtime linked to newer SQLite, "
+                    "or run 'teams cache clear --messages-only --yes' and sync again with this runtime."
+                )
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS messages (
+                account TEXT NOT NULL, conv TEXT NOT NULL, msg TEXT NOT NULL,
+                sender TEXT NOT NULL, sender_id TEXT NOT NULL, title TEXT NOT NULL,
+                timestamp TEXT NOT NULL, text TEXT NOT NULL, search_text TEXT NOT NULL,
+                is_from_me INTEGER NOT NULL, PRIMARY KEY(account,conv,msg));
+            CREATE INDEX IF NOT EXISTS chronology ON messages(account,conv,timestamp,msg);
+            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(search_text,
+                content='messages', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');
+            CREATE TRIGGER IF NOT EXISTS message_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO message_fts(rowid,search_text) VALUES(new.rowid,new.search_text); END;
+            CREATE TRIGGER IF NOT EXISTS message_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO message_fts(message_fts,rowid,search_text)
+                VALUES('delete',old.rowid,old.search_text); END;
+            CREATE TRIGGER IF NOT EXISTS message_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO message_fts(message_fts,rowid,search_text)
+                VALUES('delete',old.rowid,old.search_text);
+                INSERT INTO message_fts(rowid,search_text) VALUES(new.rowid,new.search_text); END;
+            CREATE TABLE IF NOT EXISTS coverage (
+                account TEXT NOT NULL, conv TEXT NOT NULL, title TEXT NOT NULL,
+                synced_at TEXT NOT NULL, requested_after TEXT NOT NULL,
+                complete INTEGER NOT NULL, oldest TEXT, newest TEXT, reason TEXT,
+                PRIMARY KEY(account,conv));
+            CREATE TABLE IF NOT EXISTS index_settings (
+                name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
+        if "reason" not in {r[1] for r in self.db.execute("PRAGMA table_info(coverage)")}:
+            self.db.execute("ALTER TABLE coverage ADD COLUMN reason TEXT")
+        if self._native_fts_delete and not fts_delete_enabled:
+            self.db.execute("INSERT INTO message_fts(message_fts,rank) VALUES('secure-delete',1)")
+        migrated = self.db.execute("SELECT value FROM index_settings WHERE name='fts_privacy_version'").fetchone()
+        if not migrated:
+            # Old FTS segments may contain terms deleted before secure-delete
+            # was enabled. Merge them once; ordinary local reads do not repeat it.
+            self._scrub_fts()
+            self.db.execute("INSERT OR IGNORE INTO index_settings VALUES('fts_privacy_version','1')")
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def upsert(self, messages: list[Message], title: str = "") -> int:
+        rows = [(self.account, m.conversation_id, m.id, m.sender, m.sender_id,
+                 title or m.chat_title, m.timestamp.astimezone(timezone.utc).isoformat(),
+                 m.text_content, normalize(m.text_content), int(m.is_from_me)) for m in messages]
+        scrub = False
+        if not self._native_fts_delete:
+            for row in rows:
+                previous = self.db.execute("SELECT search_text FROM messages WHERE account=? AND conv=? AND msg=?", row[:3]).fetchone()
+                if previous and previous["search_text"] != row[8]:
+                    scrub = True
+                    break
+        self.db.executemany("""INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(account,conv,msg) DO UPDATE SET sender=excluded.sender,
+            sender_id=excluded.sender_id,title=excluded.title,timestamp=excluded.timestamp,
+            text=excluded.text,search_text=excluded.search_text,is_from_me=excluded.is_from_me""", rows)
+        if scrub:
+            self._scrub_fts()
+        self.db.commit()
+        return len(rows)
+
+    def _scrub_fts(self) -> None:
+        """Remove obsolete postings; core secure_delete zeros freed blob pages."""
+        self.db.execute("INSERT INTO message_fts(message_fts) VALUES('optimize')")
+
+    def delete_messages(self, conv: str, message_ids: list[str]) -> None:
+        if not message_ids:
+            return
+        with self.db:
+            previous_changes = self.db.total_changes
+            self.db.executemany("DELETE FROM messages WHERE account=? AND conv=? AND msg=?",
+                                [(self.account, conv, str(mid)) for mid in message_ids])
+            if not self._native_fts_delete and self.db.total_changes > previous_changes:
+                self._scrub_fts()
+
+    def record_coverage(self, conv: str, title: str, cutoff: datetime, complete: bool, reason: str | None = None):
+        bounds = self.db.execute("SELECT min(timestamp),max(timestamp) FROM messages WHERE account=? AND conv=?",
+                                 (self.account, conv)).fetchone()
+        self.db.execute("INSERT OR REPLACE INTO coverage VALUES(?,?,?,?,?,?,?,?,?)",
+                        (self.account, conv, title, datetime.now(timezone.utc).isoformat(),
+                         cutoff.isoformat(), int(complete), bounds[0], bounds[1], reason))
+        self.db.commit()
+
+    @staticmethod
+    def _message(row) -> Message:
+        return Message(id=row["msg"], conversation_id=row["conv"], sender=row["sender"],
+                       sender_id=row["sender_id"], content=row["text"], text_content=row["text"],
+                       message_type="Text", timestamp=datetime.fromisoformat(row["timestamp"]),
+                       is_from_me=bool(row["is_from_me"]), chat_title=row["title"])
+
+    def resolve_chat(self, value: str) -> str:
+        if value.startswith(("19:", "48:", "28:")):
+            return value
+        try:
+            mapping = json.loads(constants.ID_MAP_FILE.read_text()).get("chats", {})
+            if value.lstrip("#") in mapping:
+                return mapping[value.lstrip("#")]
+        except (OSError, ValueError):
+            pass
+        rows = self.db.execute("SELECT conv,title FROM coverage WHERE account=?", (self.account,)).fetchall()
+        q = normalize(value)
+        exact = [r for r in rows if normalize(r["title"]) == q]
+        matches = exact or [r for r in rows if q in normalize(r["title"])]
+        if len(matches) == 1:
+            return matches[0]["conv"]
+        if matches:
+            raise ValueError("Ambiguous local chat name; use the full title or conversation ID.")
+        raise ResourceNotFoundError("Chat is not in the local index. Run: teams sync")
+
+    def search(self, query: str, top: int = 25, offset: int = 0, chat: str | None = None,
+               sender: str | None = None, after: str | None = None, before: str | None = None) -> list[Message]:
+        terms = re.findall(r"\w+", normalize(query), flags=re.UNICODE)
+        if not terms:
+            raise ValueError("Local search needs at least one word.")
+        clause = ' AND '.join('"' + term + '"*' for term in terms)
+        where = ["message_fts MATCH ?", "m.account=?"]
+        args: list = [clause, self.account]
+        if chat:
+            where.append("m.conv=?")
+            args.append(self.resolve_chat(chat))
+        if sender:
+            # Python normalization registered as SQLite function keeps Turkish matching consistent.
+            self.db.create_function("normalize_text", 1, normalize)
+            where.append("(instr(normalize_text(m.sender),?)>0 OR m.sender_id=?)")
+            args.extend([normalize(sender), sender])
+        if after:
+            where.append("m.timestamp>=?")
+            args.append(date_bound(after).isoformat())
+        if before:
+            where.append("m.timestamp<?" if len(before) == 10 else "m.timestamp<=?")
+            args.append(date_bound(before, end=True).isoformat())
+        rows = self.db.execute("SELECT m.* FROM message_fts JOIN messages m ON m.rowid=message_fts.rowid WHERE "
+                               + " AND ".join(where) + " ORDER BY m.timestamp DESC,m.msg DESC LIMIT ? OFFSET ?",
+                               [*args, top, offset]).fetchall()
+        return [self._message(r) for r in rows]
+
+    def context(self, message: Message, count: int) -> list[Message]:
+        params = (self.account, message.conversation_id, message.timestamp.isoformat(),
+                  message.timestamp.isoformat(), message.id, count)
+        before = self.db.execute("""SELECT * FROM messages WHERE account=? AND conv=?
+            AND (timestamp<? OR (timestamp=? AND msg<?)) ORDER BY timestamp DESC,msg DESC LIMIT ?""", params).fetchall()
+        after = self.db.execute("""SELECT * FROM messages WHERE account=? AND conv=?
+            AND (timestamp>? OR (timestamp=? AND msg>?)) ORDER BY timestamp,msg LIMIT ?""", params).fetchall()
+        return [self._message(r) for r in reversed(before)] + [message] + [self._message(r) for r in after]
+
+    def status(self) -> dict:
+        row = self.db.execute("SELECT count(*),min(timestamp),max(timestamp) FROM messages WHERE account=?",
+                              (self.account,)).fetchone()
+        coverage = [dict(r) for r in self.db.execute("SELECT title,synced_at,requested_after,complete,oldest,newest,reason FROM coverage WHERE account=?",
+                                                   (self.account,)).fetchall()]
+        return {"path": str(self.path), "messages": row[0], "oldest": row[1], "newest": row[2],
+                "chats": len(coverage), "coverage": coverage, "scope": "indexed chats only",
+                "live": False, "complete": bool(coverage) and all(r["complete"] for r in coverage)}
+
+
+def date_bound(value: str, end: bool = False) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if end and len(value) == 10:
+        dt += timedelta(days=1)
+    return dt.astimezone(timezone.utc)
+
+
+def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, max_pages: int = 5) -> dict:
+    """Bounded IC3 history walk; only follows same-origin server pagination links."""
+    from .client import TeamsClient
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    chat_list = client.get_chats(top=chats)
+    fetched = pages = 0
+    for chat in chat_list:
+        path = f"/users/ME/conversations/{chat.id}/messages"
+        params = {"view": "msnp24Equivalent|supportsMessageProperties", "pageSize": 100}
+        seen: set[str] = set()
+        complete = False
+        reason = "page_limit"
+        for _ in range(max_pages):
+            try:
+                response = client._ic3_get(path, params=params)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (403, 404):
+                    raise
+                reason = "access_denied" if exc.response.status_code == 403 else "unavailable"
+                break
+            pages += 1
+            if not isinstance(response, dict) or not isinstance(response.get("messages"), list):
+                # A missing/vanished conversation must never look fully indexed.
+                reason = "unavailable"
+                break
+            raw = response.get("messages", [])
+            # Include tombstones so a repeated sync can remove locally cached deletions.
+            index.delete_messages(chat.id, [
+                str(item.get("id", item.get("sequenceId", item.get("version", ""))))
+                for item in raw if TeamsClient._is_deleted_message(item)
+            ])
+            messages = [Message.from_api(m, my_user_id=client._user_id) for m in raw
+                        if m.get("messagetype") in ("Text", "RichText/Html", "RichText")
+                        and not TeamsClient._is_deleted_message(m)]
+            for m in messages:
+                m.conversation_id = chat.id
+            fetched += index.upsert([m for m in messages if m.timestamp >= cutoff], chat.display_title)
+            link = response.get("_metadata", {}).get("backwardLink")
+            times = [date_bound(m.get("composetime", m.get("originalarrivaltime", "")))
+                     for m in raw if m.get("composetime") or m.get("originalarrivaltime")]
+            if not link or (times and min(times) <= cutoff):
+                complete = True
+                reason = None
+                break
+            if link in seen:
+                reason = "cursor_repeat"
+                break
+            seen.add(link)
+            url = urlsplit(link)
+            base = urlsplit(client._chatsvc)
+            expected = base.path + f"/users/ME/conversations/{chat.id}/messages"
+            if url.scheme != base.scheme or url.netloc != base.netloc or unquote(url.path) != expected:
+                raise ValueError("Refusing an unexpected history pagination URL.")
+            path = url.path[len(base.path):]
+            params = {k: v[0] for k, v in parse_qs(url.query).items()}
+        index.record_coverage(chat.id, chat.display_title, cutoff, complete, reason)
+    return {"indexed": fetched, "pages": pages, **index.status()}

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import click
 
-from ..auth import get_auth_status, login as do_login, login_with_token, verify_tokens
+from ..auth import get_auth_status, get_tokens, login as do_login, login_with_token, refresh_tokens, verify_tokens
 from ..formatter import console, print_error, print_success
 from ..serialization import to_json
-from ._common import _get_client, _handle_api_error, should_json
+from ._common import _get_client, _handle_api_error, get_runtime_options, should_json
+from ..exceptions import AuthRequiredError
 
 
 def register(cli: click.Group) -> None:
@@ -20,8 +21,10 @@ def register(cli: click.Group) -> None:
 @click.option("--force", is_flag=True, help="Force re-login, ignore saved session")
 @click.option("--debug", is_flag=True, help="Show debug info about token extraction")
 @click.option("--with-token", is_flag=True, help="Read token from stdin instead of browser")
+@click.option("--silent", is_flag=True, help="Refresh saved credentials without opening a browser")
 @click.option("--region", default=None, help="Region (emea/amer/apac) for --with-token mode")
-def login(force: bool, debug: bool, with_token: bool, region: str | None):
+@click.option("--json", "as_json", is_flag=True, help="Output auth metadata as JSON")
+def login(force: bool, debug: bool, with_token: bool, silent: bool, region: str | None, as_json: bool):
     """Authenticate via browser and cache tokens.
 
     \b
@@ -32,7 +35,13 @@ def login(force: bool, debug: bool, with_token: bool, region: str | None):
     """
     import os
 
-    if with_token:
+    if silent and (with_token or force or region):
+        raise click.UsageError("--silent cannot be combined with --with-token, --force, or --region.")
+    if silent:
+        tokens = get_tokens()
+        required = tuple(key for key in ("ic3", "graph", "presence", "csa", "substrate") if tokens.get(key))
+        tokens = refresh_tokens(tokens, required=required, force=True)
+    elif with_token:
         import sys
 
         raw_input = sys.stdin.read().strip()
@@ -46,9 +55,16 @@ def login(force: bool, debug: bool, with_token: bool, region: str | None):
     else:
         if region:
             raise click.UsageError("--region is only used with --with-token.")
+        if get_runtime_options().no_input:
+            raise AuthRequiredError("Interactive login is disabled by --no-input. Use: teams login --silent or teams login --with-token")
         tokens = do_login(force=force, debug=debug)
 
     if verify_tokens(tokens):
+        if should_json(as_json):
+            click.echo(to_json({"authenticated": True, "region": tokens.get("region", "emea"),
+                               "user_id": tokens.get("user_id", ""),
+                               "tokens": {key: bool(tokens.get(key)) for key in ("ic3", "graph", "presence", "csa", "substrate")}}))
+            return
         print_success("Logged in successfully. Tokens cached.")
         console.print(f"  [dim]Region: {tokens.get('region', 'N/A')}[/dim]")
         console.print(f"  [dim]User ID: {tokens.get('user_id', 'N/A')[:12]}...[/dim]")

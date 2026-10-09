@@ -81,7 +81,9 @@ def test_search_messages_filters_and_resolves_chat_titles(teams_client, make_mes
     ]
 
     def fake_substrate_search(query: str, top: int):
-        assert query == "deploy"
+        assert query.startswith("(deploy) AND ClientThreadId:\"conv-1\"")
+        assert 'from:"alice"' in query
+        assert 'sent>="2026-03-11T10:00:00Z"' in query
         return search_results
 
     def fake_ic3_get(path: str, params: dict | None = None) -> dict:
@@ -145,6 +147,12 @@ def test_chat_and_read_stay_consistent(teams_client):
     teams_client._id_map["chats"] = {"1": "conv-1"}
 
     def fake_ic3_get(path: str, params: dict | None = None) -> dict:
+        if path == "/users/ME/conversations/conv-1/messages/m1":
+            return {
+                "id": "m1", "conversationid": "conv-1", "imdisplayname": "Sender",
+                "from": "8:orgid:other", "content": "<p>First</p>",
+                "messagetype": "RichText/Html", "composetime": "2026-03-11T10:00:00Z",
+            }
         assert path == "/users/ME/conversations/conv-1/messages"
         return {
             "messages": [

@@ -6,6 +6,7 @@ import click
 
 from ..formatter import console, print_chats, print_message_detail, print_messages, print_success
 from ..serialization import to_json
+from ..context import context_metadata
 from ._common import _get_client, _handle_api_error, cfg, should_json
 
 
@@ -48,7 +49,7 @@ def chats(max_count: int | None, offset: int, unread: bool, as_json: bool):
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @_handle_api_error
 def chat(chat_num: str, max_count: int | None, offset: int, after: str | None, before: str | None, as_json: bool):
-    """Read messages from a chat by its number."""
+    """Read messages from a chat by number, name, or conversation ID."""
     client = _get_client()
     top = max_count or cfg["max_messages"]
     messages = client.get_chat_messages(chat_num, top=top + offset, after=after, before=before)
@@ -72,12 +73,25 @@ def chat(chat_num: str, max_count: int | None, offset: int, after: str | None, b
 @click.command()
 @click.argument("msg_num")
 @click.option("--raw", is_flag=True, help="Show raw HTML content")
+@click.option("--context", default=0, type=click.IntRange(0, 10), help="Surrounding messages on each side.")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @_handle_api_error
-def read(msg_num: str, raw: bool, as_json: bool):
+def read(msg_num: str, raw: bool, context: int, as_json: bool):
     """Read full message detail by its number."""
     client = _get_client()
     msg = client.get_message_detail(msg_num)
+
+    if context:
+        from dataclasses import asdict
+        surrounding = client.get_message_context(msg_num, before=context, after=context)
+        if should_json(as_json):
+            payload = asdict(msg)
+            payload["context"] = [asdict(m) for m in surrounding]
+            payload["context_meta"] = context_metadata(msg, surrounding, context, context)
+            click.echo(to_json(payload))
+        else:
+            print_messages(surrounding, chat_title=msg.chat_title)
+        return
 
     if should_json(as_json):
         click.echo(to_json(msg))

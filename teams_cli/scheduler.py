@@ -6,6 +6,9 @@ pending messages locally and send them via `teams schedule-run`.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 
 from .constants import CACHE_DIR, SCHEDULED_FILE
@@ -14,6 +17,7 @@ from .constants import CACHE_DIR, SCHEDULED_FILE
 def load_scheduled() -> list[dict]:
     if SCHEDULED_FILE.exists():
         try:
+            SCHEDULED_FILE.chmod(0o600)
             return json.loads(SCHEDULED_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             pass
@@ -21,8 +25,17 @@ def load_scheduled() -> list[dict]:
 
 
 def save_scheduled(entries: list[dict]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    SCHEDULED_FILE.write_text(json.dumps(entries, indent=2))
+    CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=CACHE_DIR, delete=False) as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            temporary = Path(handle.name)
+            json.dump(entries, handle, indent=2)
+        os.replace(temporary, SCHEDULED_FILE)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def add_scheduled(

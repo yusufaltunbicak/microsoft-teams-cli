@@ -26,7 +26,7 @@ def _normalize(items: list | dict) -> list | dict:
     return items
 
 
-def to_json(items: list | dict, pretty: bool = True) -> str:
+def to_json(items: list | dict, pretty: bool = True, meta: dict | None = None) -> str:
     """Serialize data to a JSON envelope: {ok, schema_version, data}."""
     data = _normalize(items)
     envelope = {
@@ -34,6 +34,8 @@ def to_json(items: list | dict, pretty: bool = True) -> str:
         "schema_version": SCHEMA_VERSION,
         "data": data,
     }
+    if meta is not None:
+        envelope["meta"] = meta
     return json.dumps(envelope, cls=_Encoder, indent=2 if pretty else None, ensure_ascii=False)
 
 

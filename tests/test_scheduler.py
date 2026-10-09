@@ -23,6 +23,7 @@ def test_add_scheduled_persists_entry():
     assert stored[0]["conv_id"] == "conv-1"
     assert stored[0]["status"] == "pending"
     assert entry["chat_title"] == "Chat #1"
+    assert scheduler.SCHEDULED_FILE.stat().st_mode & 0o777 == 0o600
 
 
 def test_cancel_scheduled_marks_entry_cancelled():

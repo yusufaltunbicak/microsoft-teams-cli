@@ -104,7 +104,7 @@ def test_request_with_retry_does_not_retry_non_retryable_4xx(teams_client, mocke
     assert request_mock.call_count == 1
 
 
-def test_create_group_chat_uses_retry_hardened_raw_request(teams_client, mocker):
+def test_create_group_chat_does_not_replay_uncertain_500(teams_client, mocker):
     browser_headers = mocker.patch.object(
         teams_client._session,
         "browser_headers",
@@ -124,11 +124,10 @@ def test_create_group_chat_uses_retry_hardened_raw_request(teams_client, mocker)
     sleep = mocker.patch.object(client_mod.time, "sleep")
     set_topic = mocker.patch.object(teams_client, "_ic3_put", return_value={})
 
-    created = teams_client.create_group_chat(["other-user"], topic="Release Room")
-
-    assert created == {"id": "19:group@thread.v2", "status": "created"}
+    with pytest.raises(httpx.HTTPStatusError):
+        teams_client.create_group_chat(["other-user"], topic="Release Room")
     browser_headers.assert_called_once_with(teams_client._ic3)
     jitter.assert_called_once_with(is_write=True)
-    assert raw_request.call_count == 2
-    sleep.assert_called_once_with(1)
-    set_topic.assert_called_once()
+    assert raw_request.call_count == 1
+    sleep.assert_not_called()
+    set_topic.assert_not_called()

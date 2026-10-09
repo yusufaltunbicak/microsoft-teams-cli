@@ -491,10 +491,10 @@ def test_get_client_exits_cleanly_when_token_lookup_fails(mocker):
         commands_common._get_client()
 
 
-def test_handle_api_error_relogs_and_retries_successfully(mocker):
+def test_handle_api_error_does_not_replay_command_after_401(mocker):
     calls = {"count": 0}
     commands_common._client_cache["c"] = object()
-    do_login = mocker.patch.object(commands_common, "do_login", return_value={})
+    refresh = mocker.patch.object(commands_common, "refresh_tokens")
 
     @commands_common._handle_api_error
     def flaky():
@@ -503,10 +503,10 @@ def test_handle_api_error_relogs_and_retries_successfully(mocker):
             raise TokenExpiredError()
         return "ok"
 
-    assert flaky() == "ok"
-    assert calls["count"] == 2
-    do_login.assert_called_once_with()
-    assert commands_common._client_cache == {}
+    with pytest.raises(commands_common.AuthRequiredError, match="Teams token was rejected"):
+        flaky()
+    assert calls["count"] == 1
+    refresh.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -525,12 +525,11 @@ def test_handle_api_error_exits_on_non_retryable_errors(mocker, exc: Exception, 
         broken()
 
 
-def test_handle_api_error_exits_when_relogin_fails(mocker):
-    mocker.patch.object(commands_common, "do_login", side_effect=RuntimeError("still expired"))
+def test_handle_api_error_reports_explicit_login_after_401(mocker):
 
     @commands_common._handle_api_error
     def broken():
         raise TokenExpiredError()
 
-    with pytest.raises(commands_common.AuthRequiredError, match="Auto re-login failed. Run: teams login --force"):
+    with pytest.raises(commands_common.AuthRequiredError, match="Teams token was rejected. Run: teams login"):
         broken()

@@ -60,7 +60,7 @@ python -m pytest              # run mocked/unit suite
 
 - **Two-level ID mapping**: Chats get `#1, #2...`, messages also get `#1, #2...` (globally, not per-chat). Stored in `id_map.json` with `chats` and `messages` sections. Teams use `team_{n}` keys. Max 500 entries per section (LRU eviction).
 - **Token routing**: `_ic3_get`/`_ic3_post`/`_ic3_put`/`_ic3_delete` for chat service, `_graph_get`/`_graph_post` for Graph, `_csa_get` for teams listing, `_ups_post`/`_ups_put` for presence. All HTTP methods go through `_request_with_retry` which handles 429 rate limiting with automatic exponential backoff (up to 3 retries).
-- **Multi-token auth**: MSAL stores multiple tokens in localStorage. We extract `ic3`, `graph`, `presence`, `csa`, `substrate` by audience and keep polling briefly after IC3 appears so secondary tokens are cached too. Token flow: env var `TEAMS_IC3_TOKEN` → cached `tokens.json` → Playwright login.
+- **Multi-token auth**: MSAL stores multiple tokens in localStorage. We extract `ic3`, `graph`, `presence`, `csa`, `substrate` by audience and keep polling briefly after IC3 appears so secondary tokens are cached too. Token flow: env var `TEAMS_IC3_TOKEN` → cached `tokens.json` → saved MSAL access credentials → bounded silent OAuth refresh. Normal commands never open a browser; only explicit `teams login` is interactive. `teams login --silent` forces a noninteractive refresh. MFA/Conditional Access failures return exit 4 and instructions once.
 - **Region-specific endpoints**: All API URLs include region (emea/amer/apac), auto-detected from GTM localStorage during login.
 - **HTML messages**: Teams content is always HTML (`<p>text</p>`). `send_message()` wraps plain text in `<p>` tags. `_strip_html()` uses BeautifulSoup for display.
 - **JSON envelope**: All `--json` output uses `{ok: true, schema_version: "1.0", data: ...}` format. Errors return `{ok: false, error: "message"}`. Auto-JSON when stdout is piped (no `--json` flag needed).
@@ -97,3 +97,14 @@ python -m pytest              # run mocked/unit suite
 ### Dependencies
 
 click, rich, httpx, playwright, PyYAML, beautifulsoup4. Python >=3.10. Build: hatchling.
+
+## Read performance and local history
+
+- `metadata_cache.py` stores only account/tenant-scoped names, chat metadata and capability flags (0600); Graph names use GET-only batches of at most 20. Verified user 404 is cached 5 minutes; Graph presence 403 with UPS available is cached 1 hour. Read/write jitter defaults remain 0.3/2.0 seconds and are wired to config.
+- Named chats use exact or unique partial title/person matches; ambiguous names fail. Search pushes sender/chat/date constraints into Substrate before selecting top hits, uses native sender/topic fields and preserves previously displayed chat numbers.
+- `read --context N` and `search --context N` use the anchored IC3 epochTimeStamp read. Windows expand past control events using at most three window reads with 200 raw events per request; a missing anchor can need one direct-message read. Additive `context_meta` reports actual neighbors and partial windows.
+- `history.py` provides an opt-in SQLite FTS5 index at `~/.cache/teams-cli/history.sqlite3` (0600). `sync` defaults to 50 chats, 60 days, 5 pages/chat (100 messages/page); `--watch` is an optional foreground loop. Ordinary commands do not archive message text.
+- Observed edits/deletions scrub obsolete FTS terms: native secure-delete on SQLite 3.42+, mutation-only optimize on older SQLite, and one-time cleanup for existing indexes. Native format needs 3.42+ afterward; downgrade gives an actionable clear/resync instruction.
+- `search --local` works offline with saved account identity and includes additive `meta.source`/`meta.coverage`. Local matching is normalized word-prefix AND; date-only boundaries are UTC. Coverage is selected chats/window only, with explicit incomplete reasons; older edits/deletions can remain stale.
+- `cache status` reports scope; `cache clear --messages-only` removes message text, `--metadata-only` resets names/capabilities, default clears both. Clear preserves auth, ID maps and schedules and honors existing safety flags. Stop watch before clearing.
+- Use `scripts/benchmark_read.py` for sequential, read-only, content-free repeated benchmarks; do not run it concurrently with other live probes. See [PERFORMANCE.md](PERFORMANCE.md) for evidence, limitations and alternatives.
