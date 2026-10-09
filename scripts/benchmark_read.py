@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import statistics
@@ -28,6 +29,7 @@ import time
 
 
 COMMAND_NAMES = ("version", "chats", "chat", "unread", "summary", "user-search", "search")
+ALL_COMMAND_NAMES = (*COMMAND_NAMES, "search-local")
 METADATA_FILENAME = "metadata.json"
 
 
@@ -44,6 +46,27 @@ def build_commands(executable: str, user_query: str, search_query: str) -> dict[
         "search": [*prefix, "search", search_query, "--json"],
         "search-local": [*prefix, "search", search_query, "--local", "--json"],
     }
+
+
+def cli_python_version(executable: str) -> str | None:
+    """Read a Python shebang/symlink name privately; never execute extra tools.
+
+    This is the interpreter's major/minor filename, not a full runtime probe.
+    The driver Python is tracked separately from the timed executable's Python.
+    """
+    try:
+        with open(executable, "rb") as handle:
+            first_line = handle.readline(4096).decode("utf-8")
+        if not first_line.startswith("#!"):
+            return None
+        interpreter = first_line[2:].strip()
+        if not interpreter.startswith("/") or any(char.isspace() for char in interpreter):
+            return None
+        name = Path(interpreter).resolve().name
+        match = re.fullmatch(r"python(\d+\.\d+)", name)
+        return match.group(1) if match else None
+    except (OSError, UnicodeError, RuntimeError):
+        return None
 
 
 def _expiry(token: str) -> float:
@@ -97,6 +120,40 @@ def classify_output(stdout: str, stderr: str, returncode: int) -> dict:
                 value = data.get(field)
                 if type(value) is int and value >= 0:
                     result[field] = value
+        # Optional top-level metadata is allowlisted too; never copy arbitrary
+        # provider dictionaries, queries, IDs, names or timestamps into reports.
+        metadata = envelope.get("meta", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        source = envelope.get("source", metadata.get("source"))
+        if source in ("local", "live", "remote", "substrate", "ic3", "graph", "cache", "message_index"):
+            result["source"] = source
+        coverage = envelope.get("coverage", metadata.get("coverage"))
+        if isinstance(coverage, dict):
+            reduced_coverage = {}
+            for field in ("indexed_messages", "indexed_chats", "messages", "chats", "days", "pages", "max_pages"):
+                value = coverage.get(field)
+                if type(value) is int and value >= 0:
+                    reduced_coverage[field] = value
+            for field in ("complete", "partial", "exhaustive", "bounded", "stale"):
+                value = coverage.get(field)
+                if type(value) is bool:
+                    reduced_coverage[field] = value
+            per_chat = coverage.get("coverage")
+            if isinstance(per_chat, list):
+                reasons = {reason: 0 for reason in ("page_limit", "access_denied", "unavailable", "cursor_repeat")}
+                covered = 0
+                for row in per_chat:
+                    if not isinstance(row, dict):
+                        continue
+                    covered += row.get("complete") in (True, 1)
+                    reason = row.get("reason")
+                    if isinstance(reason, str) and reason in reasons:
+                        reasons[reason] += 1
+                reduced_coverage["covered_chats"] = covered
+                reduced_coverage["incomplete_reasons"] = {reason: count for reason, count in reasons.items() if count}
+            if reduced_coverage:
+                result["coverage"] = reduced_coverage
     if not result["ok"]:
         lowered = (stdout + stderr).lower()
         if returncode in (3, 4) or any(term in lowered for term in ("auth_required", "token expired", "token_expired", "login required", "authentication required", "re-login", "reauthentication", "interaction required")):
@@ -181,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--user-query", default="Yusuf", help="Passed privately; not persisted")
     parser.add_argument("--search-query", default="toplantı", help="Passed privately; not persisted")
-    parser.add_argument("--commands", nargs="+", choices=COMMAND_NAMES, default=list(COMMAND_NAMES))
+    parser.add_argument("--commands", nargs="+", choices=ALL_COMMAND_NAMES, default=list(COMMAND_NAMES))
     parser.add_argument("--cache-mode", choices=("existing", "cold", "warm"), default="existing")
     parser.add_argument("--include-local", action="store_true", help="Also benchmark read-only indexed search after sync")
     parser.add_argument("--skip-preflight", action="store_true", help="Only for updated CLI with silent auth")
@@ -196,15 +253,17 @@ def main(argv: list[str] | None = None) -> int:
     cache_dir = Path(os.environ.get("TEAMS_CLI_CACHE", Path.home() / ".cache" / "teams-cli"))
     executable = str(Path(args.teams).resolve())
     commands = build_commands(executable, args.user_query, args.search_query)
-    if args.include_local:
+    if args.include_local and "search-local" not in args.commands:
         args.commands.append("search-local")
-    if not args.skip_preflight and any(name != "version" for name in args.commands):
+    if not args.skip_preflight and any(name not in ("version", "search-local") for name in args.commands):
         if not preflight_tokens(cache_dir):
             print("Benchmark stopped: auth preflight failed; no live reads or browser launched.", file=sys.stderr)
             return 3
     report = {"schema_version": "1.0", "label": args.label, "cache_mode": args.cache_mode,
               "executable": executable, "started_utc": datetime.now(timezone.utc).isoformat(),
-              "machine": {"platform": sys.platform, "python": f"{sys.version_info.major}.{sys.version_info.minor}"},
+              "machine": {"platform": sys.platform, "architecture": platform.machine(),
+                          "driver_python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                          "cli_python": cli_python_version(executable), "cli_python_source": "interpreter_filename"},
               "runs": args.runs, "samples": [], "summary": {}}
     exit_code = 0
     try:
@@ -219,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                             break
                 for run in range(1, args.runs + 1):
                     clear_metadata()
-                    if not args.skip_preflight and name != "version" and not preflight_tokens(cache_dir):
+                    if not args.skip_preflight and name not in ("version", "search-local") and not preflight_tokens(cache_dir):
                         sample = {"ok": False, "elapsed_s": 0.0, "returncode": 3, "result_count": None,
                                   "error": "auth_required", "executed": False}
                     else:

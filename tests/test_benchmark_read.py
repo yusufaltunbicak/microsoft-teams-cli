@@ -32,6 +32,23 @@ def test_command_allowlist_contains_only_reads():
     assert all(word not in args for args in commands.values() for word in ("send", "mark-read", "set-status", "schedule-run", "--force"))
 
 
+def test_cli_runtime_from_private_shebang_distinct_from_driver(tmp_path):
+    runtime = tmp_path / "python3.12"
+    runtime.write_text("")
+    interpreter = tmp_path / "python"
+    interpreter.symlink_to(runtime)
+    executable = tmp_path / "teams"
+    executable.write_text(f"#!{interpreter}\n{SECRET}")
+    assert benchmark.cli_python_version(str(executable)) == "3.12"
+
+
+@pytest.mark.parametrize("shebang", [f"#!{SECRET}\n", "#!/usr/bin/env python3\n", "binary", "#!/usr/bin/python3\n"])
+def test_unrecognized_cli_runtime_not_retained(tmp_path, shebang):
+    executable = tmp_path / "teams"
+    executable.write_text(shebang)
+    assert benchmark.cli_python_version(str(executable)) is None
+
+
 @pytest.mark.parametrize("command", ["send", "reply", "react", "mark-read", "schedule-run", "set-status", "group-chat"])
 def test_mutating_command_is_rejected_before_execution(command, monkeypatch):
     monkeypatch.setattr(benchmark.subprocess, "run", lambda *a, **k: pytest.fail("subprocess invoked"))
@@ -63,6 +80,24 @@ def test_failure_envelope_does_not_retain_error_text():
 def test_summary_reduction_accepts_only_integer_counts():
     result = benchmark.classify_output(json.dumps({"ok": True, "data": {"recent": [{"last_message": SECRET}], "unread_count": 5, "unread_messages": SECRET}}), "", 0)
     assert result == {"ok": True, "result_count": 1, "error": None, "unread_count": 5}
+
+
+def test_local_coverage_is_reduced_to_safe_finite_metadata():
+    result = benchmark.classify_output(json.dumps({"ok": True, "data": [], "meta": {"source": "local", "coverage": {"indexed_messages": 30, "indexed_chats": 2, "complete": False, "account": SECRET, "query": SECRET, "names": [SECRET]}}}), "", 0)
+    assert result == {"ok": True, "result_count": 0, "error": None, "source": "local", "coverage": {"indexed_messages": 30, "indexed_chats": 2, "complete": False}}
+    assert SECRET not in json.dumps(result)
+
+
+def test_unrecognized_source_does_not_enter_report():
+    result = benchmark.classify_output(json.dumps({"ok": True, "data": [], "source": SECRET}), "", 0)
+    assert "source" not in result
+
+
+def test_coverage_reasons_are_counted_without_titles():
+    envelope = {"ok": True, "data": [], "meta": {"source": "local", "coverage": {"messages": 5, "coverage": [{"title": SECRET, "complete": 1}, {"title": SECRET, "complete": 0, "reason": "access_denied"}, {"title": SECRET, "complete": 0, "reason": SECRET}]}}}
+    result = benchmark.classify_output(json.dumps(envelope), "", 0)
+    assert result["coverage"] == {"messages": 5, "covered_chats": 1, "incomplete_reasons": {"access_denied": 1}}
+    assert SECRET not in json.dumps(result)
 
 
 def test_subprocess_is_captured_without_interactive_stdin(monkeypatch):
@@ -194,3 +229,46 @@ def test_full_mocked_benchmark_never_retains_message_or_query(tmp_path, monkeypa
     assert all(summary["successful_runs"] == 3 for summary in report["summary"].values())
     assert SECRET not in report_path.read_text() + capsys.readouterr().out
     assert (tmp_path / "metadata.json").read_text() == "original"
+
+
+def test_local_only_benchmark_does_not_require_auth(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TEAMS_CLI_CACHE", str(tmp_path))
+    monkeypatch.setattr(benchmark, "preflight_tokens", lambda *a: pytest.fail("local query touched auth"))
+    monkeypatch.setattr(benchmark.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"ok": true, "data": []}', ""))
+    assert benchmark.main(["--teams", "/fake/teams", "--label", "local", "--commands", "search-local", "--runs", "1"]) == 0
+    report = json.loads((tmp_path / "benchmark-local-existing.json").read_text())
+    assert report["samples"][0]["command"] == "search-local"
+
+
+def test_warm_mode_primes_once_and_local_inclusion_is_deduplicated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TEAMS_CLI_CACHE", str(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"ok": true, "data": []}', "")
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+    assert benchmark.main(["--teams", "/fake/teams", "--label", "warm", "--commands", "search-local", "--include-local", "--cache-mode", "warm", "--runs", "2"]) == 0
+    assert len(calls) == 3  # One untimed prime plus two reported samples.
+    report = json.loads((tmp_path / "benchmark-warm-warm.json").read_text())
+    assert len(report["samples"]) == 2
+    assert report["summary"]["search-local"]["successful_runs"] == 2
+
+
+@pytest.mark.parametrize(("returncode", "expected_error"), [(4, "auth_required"), (7, "rate_limited")])
+def test_live_run_stops_on_auth_or_throttle(tmp_path, monkeypatch, capsys, returncode, expected_error):
+    monkeypatch.setenv("TEAMS_CLI_CACHE", str(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode, json.dumps({"ok": False, "error": SECRET}), SECRET)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+    assert benchmark.main(["--teams", "/fake/teams", "--label", "stop", "--skip-preflight", "--commands", "search", "chats", "--runs", "3"]) == 1
+    assert len(calls) == 1
+    report = json.loads((tmp_path / "benchmark-stop-existing.json").read_text())
+    assert report["samples"][0]["error"] == expected_error
+    assert not report["summary"]
+    assert SECRET not in capsys.readouterr().out
