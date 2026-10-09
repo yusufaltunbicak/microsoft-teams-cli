@@ -8,6 +8,7 @@ from dataclasses import asdict
 from ..formatter import print_error, print_messages, print_users
 from ..serialization import to_json
 from ..history import HistoryIndex, account_key, saved_tokens, number_messages
+from ..context import context_metadata
 from ._common import _get_client, _handle_api_error, should_json
 
 
@@ -51,6 +52,7 @@ def search(query: str, max_count: int, offset: int, chat_num: str | None, from_f
                 item = asdict(msg)
                 if context:
                     item["context"] = [asdict(m) for m in surrounding]
+                    item["context_meta"] = context_metadata(msg, surrounding, context, context)
                 data.append(item)
             coverage = index.status()
         if should_json(as_json):
@@ -77,6 +79,7 @@ def search(query: str, max_count: int, offset: int, chat_num: str | None, from_f
             surrounding = client.get_message_context(str(msg.display_num), before=context, after=context)
             item = asdict(msg)
             item["context"] = [asdict(m) for m in surrounding]
+            item["context_meta"] = context_metadata(msg, surrounding, context, context)
             enriched.append(item)
         if should_json(as_json):
             click.echo(to_json(enriched))

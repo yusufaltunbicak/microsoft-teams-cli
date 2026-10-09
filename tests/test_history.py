@@ -242,6 +242,8 @@ def test_live_search_context_is_additive(runner, mocker, make_message):
     assert payload["schema_version"] == "1.0"
     assert payload["data"][0]["id"] == "anchor"
     assert payload["data"][0]["context"][0]["id"] == "anchor"
+    assert payload["data"][0]["context_meta"]["partial"]
+    assert payload["data"][0]["context_meta"]["returned_before"] == 0
     client.get_message_context.assert_called_once_with("1", before=2, after=2)
 
 
@@ -256,6 +258,15 @@ def test_read_context_preserves_message_shape(runner, mocker, make_message):
     assert result.exit_code == 0
     data = json.loads(result.output)["data"]
     assert data["id"] == "old" and data["context"][0]["id"] == "old"
+    assert data["context_meta"]["partial"]
+
+
+def test_context_metadata_counts_real_neighbors(make_message):
+    from teams_cli.context import context_metadata
+    before, anchor, after = [make_message(msg_id=str(i)) for i in range(3)]
+    info = context_metadata(anchor, [before, anchor, after], 1, 1)
+    assert info == {"requested_before": 1, "requested_after": 1,
+                    "returned_before": 1, "returned_after": 1, "partial": False}
 
 
 def test_cache_status_without_login(runner, mocker):

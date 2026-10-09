@@ -335,22 +335,36 @@ class TeamsClient:
         raise ResourceNotFoundError(f"Message #{msg_num} not found. Try re-reading the chat.")
 
     def get_message_context(self, msg_num: str, before: int = 2, after: int = 2) -> list[Message]:
-        """Fetch a bounded window around an old message with one anchored read."""
+        """Fetch a bounded window, expanding past control events when necessary."""
         if not (0 <= before <= 50 and 0 <= after <= 50):
             raise ValueError("Message context limits must be between 0 and 50")
         info = self._resolve_message_id(msg_num)
         from urllib.parse import quote
         direction = "BIDIRECTIONAL" if before and after else "BACKWARD" if before else "FORWARD"
         size = (2 * max(before, after) + 3) if before and after else max(before, after) + 2
-        response = self._ic3_get(
-            f"/users/ME/conversations/{quote(info['conv'], safe='')}/messages/epochTimeStamp/{quote(str(info['msg']), safe='')}",
-            params={"pageSize": size, "direction": direction, "includeMetadata": "true", "locationType": "Primary"},
-        )
+        path = f"/users/ME/conversations/{quote(info['conv'], safe='')}/messages/epochTimeStamp/{quote(str(info['msg']), safe='')}"
         messages = []
-        for raw in response.get("messages", []):
-            if raw.get("messagetype") in ("Text", "RichText/Html", "RichText"):
-                raw.setdefault("conversationid", info["conv"])
-                messages.append(Message.from_api(raw, my_user_id=self._user_id))
+        for attempt in range(3):
+            response = self._ic3_get(path, params={
+                "pageSize": size, "direction": direction, "includeMetadata": "true", "locationType": "Primary",
+            })
+            messages = []
+            for raw in response.get("messages", []):
+                if raw.get("messagetype") in ("Text", "RichText/Html", "RichText"):
+                    raw.setdefault("conversationid", info["conv"])
+                    messages.append(Message.from_api(raw, my_user_id=self._user_id))
+            messages.sort(key=lambda m: (m.timestamp, str(m.id)))
+            anchor_index = next((i for i, m in enumerate(messages) if str(m.id) == str(info["msg"])), -1)
+            metadata = response.get("_metadata", {})
+            previous_available = anchor_index if anchor_index >= 0 else 0
+            next_available = len(messages) - anchor_index - 1 if anchor_index >= 0 else 0
+            need_more = ((previous_available < before and metadata.get("backwardLink"))
+                         or (next_available < after and metadata.get("forwardLink")))
+            if not need_more or attempt == 2 or size >= 200:
+                break
+            # Meeting/member events count toward pageSize. Keep expansion
+            # bounded and stop at a real conversation boundary.
+            size = min(200, max(20, size * 4))
         if not any(str(m.id) == str(info["msg"]) for m in messages):
             messages.append(self.get_message_detail(msg_num))
         messages.sort(key=lambda m: (m.timestamp, str(m.id)))

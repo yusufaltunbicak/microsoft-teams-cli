@@ -286,3 +286,51 @@ def test_presence_denial_without_ups_remains_graph_error(teams_client, monkeypat
     with pytest.raises(httpx.HTTPStatusError):
         teams_client.get_presence()
     assert teams_client._metadata.get("capabilities", "graph_presence") is None
+
+
+def test_context_expands_past_control_events_but_stops_at_history_boundary(teams_client, monkeypatch):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    teams_client._metadata.put_many("chats", {"group": {"title": "Group"}})
+    sizes = []
+    def read(path, params=None):
+        sizes.append(params["pageSize"])
+        if len(sizes) == 1:
+            return {"messages": [
+                {"id": str(i), "messagetype": "Text" if i == 3 else "Event/Call", "content": "event", "composetime": f"2026-10-09T10:00:0{i}Z"}
+                for i in range(1, 6)
+            ], "_metadata": {"backwardLink": "older", "forwardLink": "newer"}}
+        return {"messages": [
+            {"id": str(i), "messagetype": "Text", "content": "message", "composetime": f"2026-10-09T10:00:0{i}Z"}
+            for i in range(1, 6)
+        ], "_metadata": {}}
+    monkeypatch.setattr(teams_client, "_ic3_get", read)
+    assert [m.id for m in teams_client.get_message_context("1", before=1, after=1)] == ["2", "3", "4"]
+    assert sizes == [5, 20]
+
+
+def test_context_does_not_expand_when_requested_side_is_exhausted(teams_client, monkeypatch):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    teams_client._metadata.put_many("chats", {"group": {"title": "Group"}})
+    calls = []
+    def read(path, params=None):
+        calls.append(1)
+        return {"messages": [
+            {"id": str(i), "messagetype": "Text", "content": "message", "composetime": f"2026-10-09T10:00:0{i}Z"}
+            for i in range(1, 4)
+        ], "_metadata": {"backwardLink": "older"}}
+    monkeypatch.setattr(teams_client, "_ic3_get", read)
+    assert [m.id for m in teams_client.get_message_context("1", before=1, after=1)] == ["2", "3"]
+    assert len(calls) == 1
+
+
+def test_context_expansion_has_request_and_page_limit(teams_client, monkeypatch):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    teams_client._metadata.put_many("chats", {"group": {"title": "Group"}})
+    sizes = []
+    def read(path, params=None):
+        sizes.append(params["pageSize"])
+        return {"messages": [{"id": "3", "messagetype": "Text", "content": "message"}],
+                "_metadata": {"backwardLink": "older", "forwardLink": "newer"}}
+    monkeypatch.setattr(teams_client, "_ic3_get", read)
+    assert len(teams_client.get_message_context("1", before=50, after=50)) == 1
+    assert sizes == [103, 200]

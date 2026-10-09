@@ -6,6 +6,7 @@ import click
 
 from ..formatter import console, print_chats, print_message_detail, print_messages, print_success
 from ..serialization import to_json
+from ..context import context_metadata
 from ._common import _get_client, _handle_api_error, cfg, should_json
 
 
@@ -86,6 +87,7 @@ def read(msg_num: str, raw: bool, context: int, as_json: bool):
         if should_json(as_json):
             payload = asdict(msg)
             payload["context"] = [asdict(m) for m in surrounding]
+            payload["context_meta"] = context_metadata(msg, surrounding, context, context)
             click.echo(to_json(payload))
         else:
             print_messages(surrounding, chat_title=msg.chat_title)
