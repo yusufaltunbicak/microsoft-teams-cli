@@ -392,3 +392,107 @@ def test_extraction_does_not_trust_inconsistent_optional_account_metadata(token_
     value["secret"] = token_factory(aud="https://graph.microsoft.com", oid="different-user")
     graph["value"] = json.dumps(value)
     assert "graph" not in extract_tokens(state)
+
+
+@respx.mock
+@pytest.mark.parametrize("browser_session", [False, True])
+def test_explicit_login_cannot_be_clobbered_by_inflight_refresh(token_factory, mocker, browser_session):
+    """A holds the refresh lock; B validates/captures, then persists last."""
+    from contextlib import contextmanager
+    import threading
+    from pathlib import Path
+
+    first = _bundle(token_factory, exp=int(time.time()) - 1)
+    second = _bundle(token_factory, oid="second-user")
+    _save_state(first)
+    auth._save_tokens(first)
+    refreshed = token_factory(aud="https://ic3.teams.office.com", exp=int(time.time()) + 7200)
+    grant_started = threading.Event()
+    release_grant = threading.Event()
+    login_lock_requested = threading.Event()
+    original_lock = auth._locked_auth_cache
+
+    @contextmanager
+    def observed_lock():
+        if threading.current_thread().name == "explicit-login":
+            login_lock_requested.set()
+        with original_lock():
+            yield
+
+    mocker.patch.object(auth, "_locked_auth_cache", side_effect=observed_lock)
+
+    def grant_response(request):
+        grant_started.set()
+        assert release_grant.wait(5), "test did not release the grant"
+        return httpx.Response(200, json={"access_token": refreshed, "refresh_token": "refreshed-private-secret"})
+
+    route = respx.post("https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token").mock(side_effect=grant_response)
+    mocker.patch.object(auth, "verify_tokens", return_value=True)
+    saved = {}
+
+    class CapturedBrowser:
+        def storage_state(self, path):
+            # Both pieces of the explicit browser session must share one lock.
+            saved["context_written"] = True
+            Path(path).write_text(json.dumps(_state(second)))
+
+    def persist_second():
+        threading.current_thread().name = "explicit-login"
+        if browser_session:
+            auth._persist_login_tokens(second, context=CapturedBrowser())
+            return second
+        return auth.login_with_token(json.dumps(second))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        refresh_future = pool.submit(auth.refresh_tokens, first)
+        try:
+            assert grant_started.wait(5)
+            login_future = pool.submit(persist_second)
+            assert login_lock_requested.wait(5)
+            # Explicit login cannot replace the active bundle while A's grant
+            # and resulting session rotation are still in flight.
+            assert claims(json.loads(auth.TOKENS_FILE.read_text())["ic3"])["oid"] == "user-123"
+            assert not saved
+        finally:
+            release_grant.set()
+        assert refresh_future.result(timeout=5)["ic3"] == refreshed
+        assert login_future.result(timeout=5)["ic3"] == second["ic3"]
+    assert route.call_count == 1
+    active = json.loads(auth.TOKENS_FILE.read_text())
+    assert claims(active["ic3"])["oid"] == "second-user"
+    if browser_session:
+        state = json.loads(auth.BROWSER_STATE_FILE.read_text())
+        assert extract_tokens(state, active)["ic3"] == second["ic3"]
+
+
+@respx.mock
+def test_refresh_rechecks_account_after_grant_before_persisting(token_factory):
+    """An older/uncooperative writer cannot roll back a completed account switch."""
+    first = _bundle(token_factory, exp=int(time.time()) - 1)
+    second = _bundle(token_factory, oid="second-user")
+    _save_state(first)
+    auth._save_tokens(first)
+
+    def grant_after_external_switch(request):
+        _save_state(second)
+        auth._save_tokens(second)
+        return httpx.Response(200, json={"access_token": token_factory(aud="https://ic3.teams.office.com")})
+
+    route = respx.post("https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token").mock(side_effect=grant_after_external_switch)
+    with pytest.raises(AuthRequiredError, match="account changed during refresh"):
+        auth.refresh_tokens(first)
+    active = json.loads(auth.TOKENS_FILE.read_text())
+    assert claims(active["ic3"])["oid"] == "second-user"
+    state = json.loads(auth.BROWSER_STATE_FILE.read_text())
+    assert extract_tokens(state, active)["ic3"] == second["ic3"]
+    assert route.call_count == 1
+
+
+def test_explicit_login_persistence_rejects_mixed_account_secondary_tokens(token_factory, mocker):
+    tokens = _bundle(token_factory)
+    tokens["graph"] = token_factory(aud="https://graph.microsoft.com", oid="second-user")
+    save_browser = mocker.patch.object(auth, "_save_browser_state")
+    with pytest.raises(AuthRequiredError, match="different accounts"):
+        auth._persist_login_tokens(tokens, context=object())
+    save_browser.assert_not_called()
+    assert not auth.TOKENS_FILE.exists()

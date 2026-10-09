@@ -106,6 +106,9 @@ python -m pytest              # run mocked/unit suite
   Commands never call interactive Playwright login implicitly. MFA/conditional
   access stops with `AuthRequiredError` (exit 4); the user runs `teams login`.
   `teams login --silent` explicitly renews saved credentials without Chromium.
+  Explicit login waits outside the refresh lock, then persists browser state and
+  tokens under the same lock. Refresh rechecks the active account after a grant;
+  browser polling must not accumulate secondary tokens across account switches.
   Never retry a whole mutation after auth failure: retry belongs to the HTTP helper.
 - **Presence fallback**: `get_presence()` tries Graph first, then falls back to Teams UPS using the presence token when Graph `/me/presence` returns 401 or 403.
 - **Summary dashboard**: `teams summary` uses `ThreadPoolExecutor(max_workers=3)` to fetch presence, recent chats, and unread chats in parallel.

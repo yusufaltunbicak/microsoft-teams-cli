@@ -152,6 +152,12 @@ def refresh_tokens(tokens: dict[str, str], required: tuple[str, ...] = ("ic3",),
                         or refreshed_claims.get("oid") != expected_claims.get("oid")
                         or refreshed_claims.get("tid") != expected_claims.get("tid")):
                     raise AuthRequiredError("Microsoft returned a token for a different Teams account or resource. Run: teams login --force")
+                # Explicit login uses the same lock. Recheck as well so an
+                # older CLI/manual cache replacement cannot be overwritten
+                # after an in-flight grant for a previous account completes.
+                active = _load_cached_tokens_raw()
+                if active and not _same_identity(result, active):
+                    raise AuthRequiredError("Teams account changed during refresh. Run the command again for the active account.")
                 result[key] = access_token
                 result[key + "_exp"] = str(_decode_exp(access_token))
                 record.value.update({"secret": access_token, "expiresOn": str(_decode_exp(access_token)),
@@ -239,6 +245,11 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
 
             try:
                 current = _extract_tokens_from_page(page, debug=debug)
+                if current.get("ic3") and tokens.get("ic3") and not _same_identity(tokens, current):
+                    # The user may select a different account while capture
+                    # is polling. Do not retain earlier secondary tokens.
+                    tokens.clear()
+                    grace_deadline = None
                 for key, value in current.items():
                     if value:
                         tokens[key] = value
@@ -254,11 +265,10 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
                 if time.time() >= grace_deadline:
                     break
 
-        # Save browser state for future SSO
-        try:
-            _save_browser_state(context)
-        except Exception:
-            pass
+        # Waiting for browser/MFA stays outside the persistence lock. Save the
+        # browser session and matching tokens together only after capture.
+        if tokens.get("ic3"):
+            _persist_login_tokens(tokens, context=context)
 
         try:
             browser.close()
@@ -272,7 +282,6 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
             "Tip: Try 'teams login --debug' to see extraction details."
         )
 
-    _save_tokens(tokens)
     return tokens
 
 
@@ -351,8 +360,25 @@ def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
     if not verify_tokens(tokens):
         raise RuntimeError("Token validation failed. The IC3 token may be expired or invalid.")
 
-    _save_tokens(tokens)
+    # Validation above is a network request and must stay outside this lock.
+    _persist_login_tokens(tokens)
     return tokens
+
+
+def _persist_login_tokens(tokens: dict[str, str], context=None) -> None:
+    """Serialize explicit account changes against silent-refresh persistence."""
+    for key in TOKEN_KEYS:
+        if tokens.get(key) and not _same_identity(tokens, {"ic3": tokens[key]}):
+            raise AuthRequiredError("Captured Teams tokens belong to different accounts. Run: teams login --force")
+    with _locked_auth_cache():
+        if context is not None:
+            try:
+                _save_browser_state(context)
+            except Exception:
+                # Keep the existing successful-login behavior when Playwright
+                # cannot export its session; token caching still works.
+                pass
+        _save_tokens(tokens)
 
 
 def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
