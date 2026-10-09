@@ -5,9 +5,17 @@ import os
 import stat
 import sys
 import time
+import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from base64 import urlsafe_b64decode
 from pathlib import Path
+
+from .exceptions import AuthRequiredError, RetryableError
+from .msal_cache import (
+    EXPIRY_BUFFER, audience, claims, credentials, extract_tokens, newest_access,
+    number, refresh_scopes, select_account,
+)
 
 from .constants import (
     BROWSER_STATE_FILE,
@@ -21,16 +29,16 @@ from .constants import (
 )
 
 TOKEN_KEYS = ("ic3", "graph", "presence", "csa", "substrate")
+_refresh_lock = threading.RLock()
 
 
-def get_tokens() -> dict[str, str]:
-    """Return valid tokens dict, from env, cache, or interactive login.
-
-    Returns dict with keys: ic3, graph, presence, csa, region, user_id
-    """
+def get_tokens(required: tuple[str, ...] = ("ic3",)) -> dict[str, str]:
+    """Use valid cache or bounded silent refresh; never open a browser."""
     # 1. Environment variable (IC3 token only)
     env_token = os.environ.get("TEAMS_IC3_TOKEN")
     if env_token:
+        if _decode_exp(env_token) <= time.time() + EXPIRY_BUFFER:
+            raise AuthRequiredError("TEAMS_IC3_TOKEN is expired or has no usable expiry. Replace it or unset it and run: teams login")
         region = os.environ.get("TEAMS_REGION", "emea")
         user_id = _decode_user_id(env_token)
         return {
@@ -41,11 +49,160 @@ def get_tokens() -> dict[str, str]:
 
     # 2. Cached tokens
     cached = _load_cached_tokens()
-    if cached:
+    if cached and all(token_is_fresh(cached, key) for key in required):
         return cached
+    return refresh_tokens(cached or _coerce_token_bundle(_load_cached_tokens_raw() or {}), required=required)
 
-    # 3. Interactive login
-    return login()
+
+def token_is_fresh(tokens: dict, key: str, buffer: float = EXPIRY_BUFFER) -> bool:
+    token = tokens.get(key, "")
+    if not isinstance(token, str) or not token:
+        return False
+    bounds = [_decode_exp(token), number(tokens.get(key + "_exp"))]
+    known = [value for value in bounds if value > 0]
+    return bool(known) and min(known) > time.time() + buffer
+
+
+def refresh_tokens(tokens: dict[str, str], required: tuple[str, ...] = ("ic3",), force: bool = False) -> dict[str, str]:
+    """Refresh only requested resources from the same saved MSAL account.
+
+    Each resource gets one refresh grant, with a 20-second total deadline. This
+    does not execute Teams or change chat read state. Conditional Access/MFA is
+    reported once with an explicit login instruction; there is no retry loop.
+    """
+    if any(key not in TOKEN_KEYS for key in required):
+        raise ValueError("Unknown token resource requested.")
+    if os.environ.get("TEAMS_IC3_TOKEN"):
+        raise AuthRequiredError("Cannot silently refresh TEAMS_IC3_TOKEN. Replace it or unset it and run: teams login")
+    if not force and all(token_is_fresh(tokens, key) for key in required):
+        return tokens
+    import httpx
+
+    with _locked_auth_cache():
+        cached = _load_cached_tokens_raw() or {}
+        if cached and not _same_identity(tokens, cached):
+            raise AuthRequiredError("Teams account changed during refresh. Run the command again for the active account.")
+        # Another process may have already refreshed the rejected token.
+        changed = any(cached.get(key) != tokens.get(key) for key in required)
+        if cached and all(token_is_fresh(cached, key) for key in required) and (not force or changed):
+            return _coerce_token_bundle(cached)
+        state = _load_browser_state()
+        records = credentials(state)
+        expected = tokens if tokens.get("ic3") else cached
+        account = select_account(records, expected)
+        selected = newest_access(records, account)
+        result = dict(tokens)
+        result.update(extract_tokens(state, expected, include_expired=True))
+        for key, record in selected.items():
+            result[key + "_exp"] = str(record.expires)
+        if tokens.get("region"):
+            result["region"] = tokens["region"]
+        for key in TOKEN_KEYS:
+            # A newer cache token must not be replaced by older saved state.
+            if token_is_fresh(tokens, key) and _decode_exp(tokens[key]) > _decode_exp(result.get(key, "")):
+                result[key] = tokens[key]
+                result[key + "_exp"] = str(_decode_exp(tokens[key]))
+        wanted = [key for key in required if force or not token_is_fresh(result, key)]
+        if not wanted:
+            _save_tokens(result)
+            return result
+        refresh_records = [record for record in records if record.kind == "refreshtoken"
+                           and record.account[0] == account[0]
+                           and record.account[1] in ("", account[1])
+                           and record.value.get("clientId", TEAMS_CLIENT_ID) == TEAMS_CLIENT_ID]
+        if not refresh_records:
+            raise AuthRequiredError("No saved Teams refresh token is available. Run: teams login")
+        refresh_record = max(refresh_records, key=lambda record: number(record.value.get("cachedAt")))
+        realm = account[1]
+        if not realm or not all(char.isalnum() or char in "-_" for char in realm):
+            raise AuthRequiredError("Saved Teams session has no usable tenant. Run: teams login")
+        deadline = time.monotonic() + 20
+        with httpx.Client(timeout=10) as client:
+            for key in wanted:
+                record = selected.get(key)
+                if record is None:
+                    raise AuthRequiredError(f"No saved Teams scope for {key}. Run: teams login")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RetryableError("Silent Teams token refresh timed out. Try the command again.")
+                try:
+                    response = client.post(
+                        f"https://login.microsoftonline.com/{realm}/oauth2/v2.0/token",
+                        data={"grant_type": "refresh_token", "client_id": TEAMS_CLIENT_ID,
+                              "refresh_token": refresh_record.token, "scope": refresh_scopes(record)},
+                        headers={"Origin": record.origin, "User-Agent": USER_AGENT},
+                        timeout=min(10, remaining),
+                    )
+                    payload = response.json()
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    raise RetryableError("Silent Teams token refresh could not reach Microsoft. Try the command again.") from exc
+                except (ValueError, TypeError) as exc:
+                    raise AuthRequiredError("Microsoft returned an unreadable token refresh response. Run: teams login") from exc
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise RetryableError("Microsoft token refresh is temporarily unavailable. Try the command again.")
+                if response.status_code != 200 or not isinstance(payload, dict) or not payload.get("access_token"):
+                    # OAuth descriptions can contain account details; never echo them.
+                    raise AuthRequiredError("Silent Teams refresh requires sign-in or MFA. Run: teams login")
+                access_token = payload["access_token"]
+                if not isinstance(access_token, str):
+                    raise AuthRequiredError("Microsoft returned an invalid token refresh response. Run: teams login")
+                refreshed_claims = claims(access_token)
+                expected_claims = claims(result.get("ic3", ""))
+                if (audience(access_token) != key
+                        or refreshed_claims.get("oid") != expected_claims.get("oid")
+                        or refreshed_claims.get("tid") != expected_claims.get("tid")):
+                    raise AuthRequiredError("Microsoft returned a token for a different Teams account or resource. Run: teams login --force")
+                result[key] = access_token
+                result[key + "_exp"] = str(_decode_exp(access_token))
+                record.value.update({"secret": access_token, "expiresOn": str(_decode_exp(access_token)),
+                                     "cachedAt": str(int(time.time()))})
+                record.entry["value"] = json.dumps(record.value)
+                if payload.get("refresh_token"):
+                    refresh_record.value["secret"] = payload["refresh_token"]
+                    refresh_record.entry["value"] = json.dumps(refresh_record.value)
+                # Preserve successful progress even if a later audience needs MFA.
+                _atomic_json_write(BROWSER_STATE_FILE, state)
+                _save_tokens(result)
+        return result
+
+
+def _same_identity(left: dict, right: dict) -> bool:
+    if not left.get("ic3"):
+        return True
+    first, second = claims(left.get("ic3", "")), claims(right.get("ic3", ""))
+    return (first.get("oid"), first.get("tid")) == (second.get("oid"), second.get("tid"))
+
+
+def _load_browser_state() -> dict:
+    try:
+        state = json.loads(BROWSER_STATE_FILE.read_text())
+        if isinstance(state, dict):
+            _chmod_600(BROWSER_STATE_FILE)
+            return state
+    except (ValueError, OSError):
+        pass
+    raise AuthRequiredError("No usable saved Teams browser session. Run: teams login")
+
+
+@contextmanager
+def _locked_auth_cache():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with _refresh_lock:
+        lock_path = CACHE_DIR / "auth.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            try:
+                import fcntl
+            except ImportError:  # Windows still has the in-process lock.
+                fcntl = None
+            if fcntl:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            if 'fcntl' in locals() and fcntl:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 def login(force: bool = False, debug: bool = False) -> dict[str, str]:
@@ -87,7 +244,7 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
                         tokens[key] = value
             except Exception as e:
                 if debug:
-                    _print_stderr(f"  [debug] Token extraction error: {e}")
+                    _print_stderr(f"  [debug] Token extraction unavailable: {type(e).__name__}")
 
             if tokens.get("ic3"):
                 if grace_deadline is None:
@@ -99,8 +256,7 @@ def login(force: bool = False, debug: bool = False) -> dict[str, str]:
 
         # Save browser state for future SSO
         try:
-            context.storage_state(path=str(BROWSER_STATE_FILE))
-            _chmod_600(BROWSER_STATE_FILE)
+            _save_browser_state(context)
         except Exception:
             pass
 
@@ -163,6 +319,8 @@ def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
             val = parsed.get(key, "")
             if val and len(val.split(".")) != 3:
                 raise ValueError(f"Invalid JWT format for '{key}' token.")
+            if val and not _same_identity({"ic3": ic3}, {"ic3": val}):
+                raise ValueError(f"The '{key}' token belongs to a different account or tenant.")
 
         tokens = {
             "ic3": ic3,
@@ -198,88 +356,14 @@ def login_with_token(raw_input: str, region: str = "emea") -> dict[str, str]:
 
 
 def _extract_tokens_from_page(page, debug: bool = False) -> dict[str, str]:
-    """Extract MSAL tokens from Teams localStorage via JS evaluation."""
-    result = page.evaluate("""() => {
-        const tokens = {};
-        const region_data = {};
-
-        for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            const val = localStorage.getItem(key);
-
-            // MSAL access tokens
-            if (key.includes('-accesstoken-')) {
-                try {
-                    const obj = JSON.parse(val);
-                    const secret = obj.secret || '';
-                    const target = (obj.target || '').toLowerCase();
-                    const env = obj.environment || '';
-
-                    if (secret.length > 100) {
-                        if (target.includes('ic3.teams.office.com') || key.includes('ic3.teams.office.com')) {
-                            tokens['ic3'] = secret;
-                        } else if (target.includes('graph.microsoft.com') || key.includes('graph.microsoft.com')) {
-                            tokens['graph'] = secret;
-                        } else if (target.includes('presence.teams.microsoft') || key.includes('presence.teams.microsoft')) {
-                            tokens['presence'] = secret;
-                        } else if (target.includes('chatsvcagg.teams.microsoft.com') || key.includes('chatsvcagg.teams.microsoft.com')) {
-                            tokens['csa'] = secret;
-                        } else if (target.includes('substrate.office.com') || key.includes('substrate.office.com')) {
-                            tokens['substrate'] = secret;
-                        }
-                    }
-                } catch(e) {}
-            }
-
-            // Region discovery
-            if (key.includes('DISCOVER-REGION-GTM') || key.includes('Discover.DISCOVER-REGION-GTM')) {
-                try {
-                    const obj = JSON.parse(val);
-                    if (obj.regionGtms) {
-                        // regionGtms is a JSON string itself
-                        const gtms = typeof obj.regionGtms === 'string' ? JSON.parse(obj.regionGtms) : obj.regionGtms;
-                        if (gtms.chatService) {
-                            // Extract region from chatService URL
-                            const match = gtms.chatService.match(/chatsvc\\/([a-z]+)/);
-                            if (match) tokens['region'] = match[1];
-                        }
-                    }
-                    // Also check for direct region field
-                    if (obj.region) tokens['region'] = obj.region;
-                } catch(e) {
-                    // Try plain value
-                    try {
-                        const obj2 = JSON.parse(val);
-                        if (typeof obj2 === 'object') {
-                            const chatSvc = obj2.chatService || '';
-                            const match = chatSvc.match(/chatsvc\\/([a-z]+)/);
-                            if (match) tokens['region'] = match[1];
-                        }
-                    } catch(e2) {}
-                }
-            }
-        }
-
-        return tokens;
-    }""")
-
+    """Parse modern and legacy MSAL records with the same offline selector."""
+    snapshot = page.evaluate("""() => ({origins: [{origin: location.origin,
+        localStorage: Object.keys(localStorage).map(name => ({name, value: localStorage.getItem(name)}))
+    }]})""")
+    result = extract_tokens(snapshot)
     if debug:
-        for k, v in result.items():
-            if k in ("ic3", "graph", "presence", "csa", "substrate"):
-                _print_stderr(f"  [debug] {k} token: {len(v)} chars")
-            else:
-                _print_stderr(f"  [debug] {k}: {v}")
-
-    # Extract user_id from IC3 token
-    if result.get("ic3"):
-        result["user_id"] = _decode_user_id(result["ic3"])
-        if debug:
-            _print_stderr(f"  [debug] user_id: {result.get('user_id', 'unknown')}")
-
-    # Default region
-    if "region" not in result:
-        result["region"] = "emea"
-
+        for key in TOKEN_KEYS:
+            _print_stderr(f"  [debug] {key}: {'available' if result.get(key) else 'missing or expired'}")
     return result
 
 
@@ -354,6 +438,17 @@ def get_auth_status(check: bool = False) -> dict[str, object]:
     if check and token_snapshot.get("ic3"):
         ic3_valid = verify_tokens(_coerce_token_bundle(token_snapshot))
 
+    resource_status = {}
+    for key in TOKEN_KEYS:
+        token = token_snapshot.get(key, "")
+        expiry = number(token_snapshot.get(key + "_exp")) or _decode_exp(token)
+        remaining = int(expiry - time.time()) if expiry else None
+        resource_status[key] = {
+            "present": bool(token), "fresh": token_is_fresh(token_snapshot, key),
+            "expires_at": datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat() if expiry else None,
+            "expires_in_seconds": remaining,
+        }
+
     return {
         "auth_source": source,
         "cache": {
@@ -368,6 +463,7 @@ def get_auth_status(check: bool = False) -> dict[str, object]:
             "display_name": display_name,
         },
         "tokens": {key: bool(token_snapshot.get(key, "")) for key in TOKEN_KEYS},
+        "resources": resource_status,
         "ic3": {
             "expires_at": expires_at,
             "expires_in_seconds": expires_in_seconds,
@@ -378,76 +474,37 @@ def get_auth_status(check: bool = False) -> dict[str, object]:
 
 
 def _decode_user_id(token: str) -> str:
-    """Extract oid (object ID) from JWT claims."""
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return ""
-        payload = parts[1]
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = json.loads(urlsafe_b64decode(payload))
-        return decoded.get("oid", "")
-    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
-        return ""
+    """Extract oid from a JWT without treating its contents as trusted data."""
+    value = claims(token).get("oid", "")
+    return value if isinstance(value, str) else ""
 
 
 def _decode_exp(token: str) -> float:
-    """Extract exp claim from JWT."""
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return time.time() + 3600
-        payload = parts[1]
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = json.loads(urlsafe_b64decode(payload))
-        return float(decoded.get("exp", time.time() + 3600))
-    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
-        return time.time() + 3600
+    """Unknown expiry fails closed instead of assuming an extra hour."""
+    return number(claims(token).get("exp"))
 
 
 def _decode_display_name(token: str) -> str:
-    """Extract name from JWT claims."""
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return ""
-        payload = parts[1]
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = json.loads(urlsafe_b64decode(payload))
-        return decoded.get("name", "")
-    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
-        return ""
+    value = claims(token).get("name", "")
+    return value if isinstance(value, str) else ""
 
 
 def _load_cached_tokens() -> dict[str, str] | None:
     data = _load_cached_tokens_raw()
-    if not data:
+    if not data or not token_is_fresh(data, "ic3"):
         return None
-
-    ic3 = data.get("ic3")
-    if not ic3:
-        return None
-
-    exp = data.get("ic3_exp", 0)
-    # Check expiry with 5-minute buffer
-    if time.time() > exp - 300:
-        return None
-    return {
-        "ic3": ic3,
-        "graph": data.get("graph", ""),
-        "presence": data.get("presence", ""),
-        "csa": data.get("csa", ""),
-        "substrate": data.get("substrate", ""),
-        "region": data.get("region", "emea"),
-        "user_id": data.get("user_id", ""),
-    }
+    return _coerce_token_bundle(data)
 
 
 def _load_cached_tokens_raw() -> dict[str, object] | None:
     if not TOKENS_FILE.exists():
         return None
     try:
-        return json.loads(TOKENS_FILE.read_text())
+        data = json.loads(TOKENS_FILE.read_text())
+        if isinstance(data, dict):
+            _chmod_600(TOKENS_FILE)
+            return data
+        return None
     except (json.JSONDecodeError, OSError, ValueError):
         return None
 
@@ -465,15 +522,19 @@ def _save_tokens(tokens: dict[str, str]) -> None:
         "region": tokens.get("region", "emea"),
         "user_id": tokens.get("user_id", ""),
     }
-    TOKENS_FILE.write_text(json.dumps(data))
-    _chmod_600(TOKENS_FILE)
+    for key in TOKEN_KEYS:
+        data[key + "_exp"] = _decode_exp(tokens.get(key, "")) if tokens.get(key) else 0
+    for key in ("tenant_id", "home_account_id"):
+        if tokens.get(key):
+            data[key] = tokens[key]
+    _atomic_json_write(TOKENS_FILE, data)
 
     # Cache user profile
     if ic3:
         name = _decode_display_name(ic3)
         if name:
             profile = {"display_name": name, "user_id": tokens.get("user_id", "")}
-            USER_PROFILE_FILE.write_text(json.dumps(profile))
+            _atomic_json_write(USER_PROFILE_FILE, profile)
 
 
 def _chmod_600(path: Path) -> None:
@@ -510,12 +571,38 @@ def _print_stderr(message: str) -> None:
 
 
 def _coerce_token_bundle(data: dict[str, object]) -> dict[str, str]:
-    return {
-        "ic3": str(data.get("ic3", "") or ""),
-        "graph": str(data.get("graph", "") or ""),
-        "presence": str(data.get("presence", "") or ""),
-        "csa": str(data.get("csa", "") or ""),
-        "substrate": str(data.get("substrate", "") or ""),
-        "region": str(data.get("region", "emea") or "emea"),
-        "user_id": str(data.get("user_id", "") or ""),
-    }
+    result = {key: str(data.get(key, "") or "") for key in TOKEN_KEYS}
+    result.update({"region": str(data.get("region", "emea") or "emea"),
+                   "user_id": str(data.get("user_id") or _decode_user_id(result["ic3"]))})
+    for key in ("tenant_id", "home_account_id", *(name + "_exp" for name in TOKEN_KEYS)):
+        if data.get(key):
+            result[key] = str(data[key])
+    return result
+
+
+def _atomic_json_write(path: Path, data: dict) -> None:
+    """Create private files before writing secrets, then atomically replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def _save_browser_state(context) -> None:
+    descriptor, temp_name = tempfile.mkstemp(prefix=".browser-state.", dir=BROWSER_STATE_FILE.parent)
+    os.close(descriptor)
+    try:
+        context.storage_state(path=temp_name)
+        _chmod_600(Path(temp_name))
+        os.replace(temp_name, BROWSER_STATE_FILE)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)

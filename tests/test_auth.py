@@ -4,6 +4,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
+from pathlib import Path
 
 import pytest
 import respx
@@ -119,12 +120,14 @@ def test_verify_tokens_returns_true_on_200(fake_tokens: dict[str, str]):
 def test_extract_tokens_from_page_classifies_tokens(fake_tokens: dict[str, str]):
     class FakePage:
         def evaluate(self, _script: str) -> dict[str, str]:
-            return {
-                "ic3": fake_tokens["ic3"],
-                "graph": fake_tokens["graph"],
-                "presence": fake_tokens["presence"],
-                "csa": fake_tokens["csa"],
-            }
+            from teams_cli.msal_cache import TOKEN_AUDIENCES
+            return {"origins": [{"origin": "https://teams.cloud.microsoft", "localStorage": [
+                {"name": f"msal.2|user|accesstoken|{name}", "value": json.dumps({
+                    "credentialType": "AccessToken", "secret": fake_tokens[name],
+                    "target": TOKEN_AUDIENCES[name], "homeAccountId": "user-123.tenant-123",
+                    "realm": "tenant-123",
+                })} for name in ("ic3", "graph", "presence", "csa")
+            ]}]}
 
     result = auth._extract_tokens_from_page(FakePage())
 
@@ -158,7 +161,7 @@ def test_login_uses_mocked_playwright_and_saves_tokens(
 
         def storage_state(self, path: str) -> None:
             captured["storage_state"] = path
-            auth.BROWSER_STATE_FILE.write_text("{}")
+            Path(path).write_text("{}")
 
     class FakeBrowser:
         def new_context(self, **kwargs):
@@ -207,7 +210,8 @@ def test_login_uses_mocked_playwright_and_saves_tokens(
         "user_agent": auth.USER_AGENT,
         "storage_state": str(auth.BROWSER_STATE_FILE),
     }
-    assert captured["storage_state"] == str(auth.BROWSER_STATE_FILE)
+    assert Path(captured["storage_state"]).parent == auth.BROWSER_STATE_FILE.parent
+    assert auth.BROWSER_STATE_FILE.stat().st_mode & 0o777 == 0o600
     assert extraction_calls["count"] >= 2
     assert json.loads(auth.TOKENS_FILE.read_text())["user_id"] == "user-123"
 

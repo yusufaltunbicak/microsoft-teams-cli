@@ -12,7 +12,7 @@ import click
 import httpx
 import yaml
 
-from ..auth import get_tokens, login as do_login, _decode_exp
+from ..auth import get_tokens, refresh_tokens, token_is_fresh
 from ..client import TeamsClient
 from ..config import load_config
 from ..exceptions import (
@@ -64,22 +64,9 @@ cfg = _ConfigProxy()
 
 
 def _check_token_expiry(tokens: dict[str, str]) -> dict[str, str]:
-    """Check if IC3 token is expired and re-login if needed."""
-    import time
-
-    ic3 = tokens.get("ic3", "")
-    if not ic3:
-        return tokens
-
-    exp = _decode_exp(ic3)
-    # 60-second buffer — proactively refresh before actual expiry
-    if time.time() > exp - 60:
-        print_error("Token expiring soon. Re-authenticating...")
-        try:
-            tokens = do_login()
-            print_success("Re-login successful.")
-        except Exception as exc:
-            raise AuthRequiredError("Auto re-login failed. Run: teams login --force") from exc
+    """Preflight IC3 silently; interactive login is an explicit command."""
+    if tokens.get("ic3") and not token_is_fresh(tokens, "ic3"):
+        return refresh_tokens(tokens)
     return tokens
 
 
@@ -89,13 +76,12 @@ def _get_client() -> TeamsClient:
             tokens = get_tokens()
         except RuntimeError as exc:
             raise AuthRequiredError(str(exc)) from exc
-        tokens = _check_token_expiry(tokens)
         _client_cache["c"] = TeamsClient(tokens)
     return _client_cache["c"]
 
 
 def _handle_api_error(fn):
-    """Decorator to catch API errors. Auto re-login on 401."""
+    """Classify API errors without replaying a possibly mutating command."""
     import functools
 
     @functools.wraps(fn)
@@ -104,13 +90,8 @@ def _handle_api_error(fn):
             return fn(*args, **kwargs)
         except click.ClickException:
             raise
-        except TokenExpiredError:
-            try:
-                do_login()
-                _client_cache.clear()
-                return fn(*args, **kwargs)
-            except Exception as exc:
-                raise AuthRequiredError("Auto re-login failed. Run: teams login --force") from exc
+        except TokenExpiredError as exc:
+            raise AuthRequiredError("Teams token was rejected. Run: teams login; then retry the command.") from exc
         except RateLimitError:
             raise
         except ResourceNotFoundError:
