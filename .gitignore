@@ -46,6 +46,11 @@ browser-state.json
 id_map.json
 scheduled.json
 user_profile.json
+metadata.json
+metadata.lock
+metadata.json.lock
+auth.lock
+history.sqlite3*
 
 # Screenshots for README (user selects which to include)
 screenshots/

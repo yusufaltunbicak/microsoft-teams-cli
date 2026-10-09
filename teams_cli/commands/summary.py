@@ -31,6 +31,9 @@ def _fetch_presence(client):
 
 def _fetch_chats(client, top):
     try:
+        # Both dashboard consumers use the same 400-row live snapshot. This
+        # prevents a smaller recent request racing and duplicating the read.
+        client._get_conversations(400)
         return client.get_chats(top=top)
     except Exception:
         return []

@@ -1607,7 +1607,9 @@ class TeamsClient:
     def _id_map_lock(self) -> Iterator[None]:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = Path(f"{ID_MAP_FILE}.lock")
-        with lock_path.open("a+") as lock_file:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a+") as lock_file:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
