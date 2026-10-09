@@ -212,6 +212,7 @@ def date_bound(value: str, end: bool = False) -> datetime:
 
 def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, max_pages: int = 5) -> dict:
     """Bounded IC3 history walk; only follows same-origin server pagination links."""
+    from .client import TeamsClient
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     chat_list = client.get_chats(top=chats)
     fetched = pages = 0
@@ -238,12 +239,12 @@ def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, m
             # Include tombstones so a repeated sync can remove locally cached deletions.
             with index.db:
                 for item in raw:
-                    if item.get("properties", {}).get("deletetime") or item.get("messagetype") == "Control/MessageDelete":
+                    if TeamsClient._is_deleted_message(item):
                         index.db.execute("DELETE FROM messages WHERE account=? AND conv=? AND msg=?",
                                          (index.account, chat.id, str(item.get("id", ""))))
             messages = [Message.from_api(m, my_user_id=client._user_id) for m in raw
                         if m.get("messagetype") in ("Text", "RichText/Html", "RichText")
-                        and not m.get("properties", {}).get("deletetime")]
+                        and not TeamsClient._is_deleted_message(m)]
             for m in messages:
                 m.conversation_id = chat.id
             fetched += index.upsert([m for m in messages if m.timestamp >= cutoff], chat.display_title)

@@ -334,3 +334,47 @@ def test_context_expansion_has_request_and_page_limit(teams_client, monkeypatch)
     monkeypatch.setattr(teams_client, "_ic3_get", read)
     assert len(teams_client.get_message_context("1", before=50, after=50)) == 1
     assert sizes == [103, 200]
+
+
+def test_chat_and_context_exclude_deleted_text_neighbors(teams_client, monkeypatch):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    teams_client._metadata.put_many("chats", {"group": {"title": "Group"}})
+    rows = [
+        {"id": str(i), "messagetype": "Text", "content": "message", "composetime": f"2026-10-09T10:00:0{i}Z",
+         "properties": {"deletetime": "123456789"} if i == 2 else {}}
+        for i in range(1, 5)
+    ]
+    monkeypatch.setattr(teams_client, "_ic3_get", lambda *a, **k: {"messages": rows})
+    context = teams_client.get_message_context("1", before=1, after=1)
+    assert [m.id for m in context] == ["1", "3", "4"]
+    chat = teams_client.get_chat_messages("19:group@thread.v2")
+    assert all(m.id != "2" for m in chat)
+
+
+@pytest.mark.parametrize("marker", [
+    {"messagetype": "Text", "properties": {"deletetime": "123456789"}},
+    {"messagetype": "RichText/Html", "properties": {"deletetime": 123456789}},
+    {"messagetype": "Control/MessageDelete", "properties": {}},
+])
+def test_context_deleted_anchor_is_rejected_without_detail_fallback(teams_client, monkeypatch, marker):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    monkeypatch.setattr(teams_client, "_ic3_get", lambda *a, **k: {"messages": [{"id": "3", "content": "old content", **marker}]})
+    monkeypatch.setattr(teams_client, "get_message_detail", lambda *a: pytest.fail("deleted anchor must never be fetched back"))
+    with pytest.raises(ResourceNotFoundError, match="deleted"):
+        teams_client.get_message_context("1")
+
+
+@pytest.mark.parametrize("marker", [
+    {"messagetype": "Text", "properties": {"deletetime": "123456789"}},
+    {"messagetype": "Control/MessageDelete", "properties": {}},
+])
+def test_detail_rejects_deleted_anchor(teams_client, monkeypatch, marker):
+    teams_client._update_id_map(lambda value: value["messages"].update({"1": {"conv": "group", "msg": "3"}}))
+    monkeypatch.setattr(teams_client, "_ic3_get", lambda *a, **k: {"id": "3", "content": "old content", **marker})
+    with pytest.raises(ResourceNotFoundError, match="deleted"):
+        teams_client.get_message_detail("1")
+
+
+@pytest.mark.parametrize("value", [None, "", 0, "0", False])
+def test_zero_deletion_time_does_not_hide_live_message(value):
+    assert not TeamsClient._is_deleted_message({"messagetype": "Text", "properties": {"deletetime": value}})

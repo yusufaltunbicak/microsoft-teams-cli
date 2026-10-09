@@ -293,7 +293,7 @@ class TeamsClient:
         for m in raw_messages:
             msg_type = m.get("messagetype", "")
             # Only include real messages
-            if msg_type in ("Text", "RichText/Html", "RichText"):
+            if msg_type in ("Text", "RichText/Html", "RichText") and not self._is_deleted_message(m):
                 msg = Message.from_api(m, my_user_id=self._user_id)
                 messages.append(msg)
 
@@ -327,12 +327,22 @@ class TeamsClient:
         )
         m_id = raw.get("id", raw.get("sequenceId", raw.get("version", "")))
         if str(m_id) == str(msg_id):
+            if self._is_deleted_message(raw):
+                raise ResourceNotFoundError(f"Message #{msg_num.removeprefix('#')} has been deleted.")
             raw.setdefault("conversationid", conv_id)
             msg = Message.from_api(raw, my_user_id=self._user_id)
             msg.display_num = int(msg_num.removeprefix("#"))
             return msg
 
         raise ResourceNotFoundError(f"Message #{msg_num} not found. Try re-reading the chat.")
+
+    @staticmethod
+    def _is_deleted_message(raw: dict) -> bool:
+        """Tombstones may retain an old Text type and body in the API response."""
+        if raw.get("messagetype") == "Control/MessageDelete":
+            return True
+        deleted_at = raw.get("properties", {}).get("deletetime")
+        return deleted_at not in (None, "", 0, "0", False)
 
     def get_message_context(self, msg_num: str, before: int = 2, after: int = 2) -> list[Message]:
         """Fetch a bounded window, expanding past control events when necessary."""
@@ -350,7 +360,11 @@ class TeamsClient:
             })
             messages = []
             for raw in response.get("messages", []):
-                if raw.get("messagetype") in ("Text", "RichText/Html", "RichText"):
+                deleted = self._is_deleted_message(raw)
+                raw_id = raw.get("id", raw.get("sequenceId", raw.get("version", "")))
+                if str(raw_id) == str(info["msg"]) and deleted:
+                    raise ResourceNotFoundError(f"Message #{msg_num.removeprefix('#')} has been deleted.")
+                if not deleted and raw.get("messagetype") in ("Text", "RichText/Html", "RichText"):
                     raw.setdefault("conversationid", info["conv"])
                     messages.append(Message.from_api(raw, my_user_id=self._user_id))
             messages.sort(key=lambda m: (m.timestamp, str(m.id)))

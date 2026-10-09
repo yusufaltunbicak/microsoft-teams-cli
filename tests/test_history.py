@@ -133,6 +133,21 @@ def test_sync_removes_tombstones(tmp_path, make_chat, make_message):
         assert not index.search("hello")
 
 
+@pytest.mark.parametrize("deleted_at", [None, "", 0, "0", False])
+def test_sync_keeps_messages_with_zero_deletion_marker(tmp_path, make_chat, deleted_at):
+    class Client:
+        _user_id = "me"
+        _chatsvc = "https://teams.cloud.microsoft/api/chatsvc/emea/v1"
+        def get_chats(self, top): return [make_chat(chat_id="19:c@thread.v2")]
+        def _ic3_get(self, path, params):
+            message = raw_message("1", datetime.now(timezone.utc))
+            message["properties"] = {"deletetime": deleted_at}
+            return {"messages": [message]}
+    with HistoryIndex("a", tmp_path / "history.sqlite3") as index:
+        result = sync_history(Client(), index)
+        assert result["messages"] == 1
+
+
 def test_sync_missing_messages_is_incomplete(tmp_path, make_chat):
     class Client:
         _user_id = "me"
@@ -267,6 +282,13 @@ def test_context_metadata_counts_real_neighbors(make_message):
     info = context_metadata(anchor, [before, anchor, after], 1, 1)
     assert info == {"requested_before": 1, "requested_after": 1,
                     "returned_before": 1, "returned_after": 1, "partial": False}
+
+
+def test_context_metadata_normalizes_provider_id_types(make_message):
+    from teams_cli.context import context_metadata
+    anchor = make_message(msg_id="12")
+    numeric_anchor = make_message(msg_id=12)
+    assert context_metadata(anchor, [numeric_anchor], 0, 0)["partial"] is False
 
 
 def test_cache_status_without_login(runner, mocker):
