@@ -163,6 +163,12 @@ continues with the other selected chats. Repeated sync updates observed edits
 and deletions in the pages it revisits; older unvisited changes can remain stale.
 Imported text persists until cache deletion; `--days` bounds the current import
 and does not erase older rows from a previous wider import.
+The index removes obsolete full-text terms when it observes edits or deletions.
+SQLite 3.42+ uses FTS5 secure-delete; older SQLite merges obsolete terms on those
+mutations, which can make sync slower. Existing indexes receive a one-time cleanup,
+not a cleanup on every search. A secure-delete index written by newer SQLite
+requires SQLite 3.42+ afterward; to use an older runtime, clear only message history
+and sync again, or upgrade that runtime's SQLite.
 `--watch` is a foreground loop with a minimum interval of 60 seconds; no daemon,
 startup service or scheduler is installed.
 

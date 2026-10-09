@@ -125,6 +125,22 @@ Deleted-message tombstones are excluded from live reads and synchronized text;
 reading a deleted anchor returns the existing not-found exit code rather than
 exposing any body retained in the provider response.
 
+Publication review also reproduced deleted terms remaining in FTS shadow blobs
+despite core `PRAGMA secure_delete`. The index now enables FTS5 secure-delete on
+SQLite 3.42+, cleans existing obsolete segments once, and uses an optimize pass
+after observed text updates/deletions on older SQLite. Ordinary local reads do
+not repeat that cleanup. The old-runtime fallback can slow sync; an index using
+the newer FTS format requires SQLite 3.42+ to reopen, with a clear/resync instruction
+if the runtime is downgraded. These behavior and format limits are documented in
+[SQLite's FTS5 secure-delete specification](https://sqlite.org/fts5.html#the_secure_delete_configuration_option)
+and verified with synthetic message text, including inspection of FTS blobs and
+database bytes. The local-search timings above precede this additional protection;
+the migration is a one-time cost. The final protected warm local search measured
+**0.106 s median** (0.104–0.107 s, three runs), with the same 25 hits and coverage,
+recorded separately as `benchmark-publication-local-warm.json`. The old-runtime
+cleanup was also verified with a separately compiled SQLite 3.41.2 and synthetic
+deleted/updated terms; temporary sources and test databases were removed.
+
 The code also carries `SyncState` and backward pagination links, with a
 100-message historical-page pattern and a 30-minute delta-window pattern. Those
 constants are evidence of web-client strategies, not a stable public protocol or

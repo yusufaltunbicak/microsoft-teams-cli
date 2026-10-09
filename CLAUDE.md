@@ -69,6 +69,10 @@ python -m pytest              # run mocked/unit suite
   `complete` applies to the requested window in selected chats, not all Teams.
   Incomplete coverage records `page_limit`, `access_denied`, `unavailable` or
   `cursor_repeat`; a permission-denied chat does not abort every other chat.
+  Core and FTS5 secure-delete protect observed edits/deletions on SQLite 3.42+;
+  older SQLite scrubs obsolete postings by optimize only after content changes or
+  deletions. A one-time migration cleans preexisting obsolete postings. Newer FTS
+  format requires 3.42+; downgrade fails with an actionable clear/resync instruction.
 - **`context.py`** — Additive neighbor-count metadata for live/local context;
   anchors match conversation and message IDs normalized as strings.
 - **`anti_detection.py`** — `BrowserSession`: request jitter, full browser headers (Sec-Fetch-*, sec-ch-ua-*), proxy support, configurable timeout.

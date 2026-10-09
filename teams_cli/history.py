@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit, unquote
 
 from . import constants
-from .exceptions import AuthRequiredError, ResourceNotFoundError
+from .exceptions import AuthRequiredError, ConfigurationError, ResourceNotFoundError
 from .models import Message
 
 
@@ -73,6 +73,18 @@ class HistoryIndex:
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA secure_delete=ON")
+        self._native_fts_delete = sqlite3.sqlite_version_info >= (3, 42, 0)
+        fts_config_exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='message_fts_config'").fetchone()
+        secure_delete = (self.db.execute("SELECT v FROM message_fts_config WHERE k='secure-delete'").fetchone()
+                         if fts_config_exists else None)
+        fts_delete_enabled = bool(secure_delete and secure_delete[0] in (1, "1"))
+        if not self._native_fts_delete:
+            if fts_delete_enabled:
+                self.db.close()
+                raise ConfigurationError(
+                    "This local index requires SQLite 3.42 or newer. Use a Python runtime linked to newer SQLite, "
+                    "or run 'teams cache clear --messages-only --yes' and sync again with this runtime."
+                )
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 account TEXT NOT NULL, conv TEXT NOT NULL, msg TEXT NOT NULL,
@@ -96,9 +108,19 @@ class HistoryIndex:
                 synced_at TEXT NOT NULL, requested_after TEXT NOT NULL,
                 complete INTEGER NOT NULL, oldest TEXT, newest TEXT, reason TEXT,
                 PRIMARY KEY(account,conv));
+            CREATE TABLE IF NOT EXISTS index_settings (
+                name TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         if "reason" not in {r[1] for r in self.db.execute("PRAGMA table_info(coverage)")}:
             self.db.execute("ALTER TABLE coverage ADD COLUMN reason TEXT")
+        if self._native_fts_delete and not fts_delete_enabled:
+            self.db.execute("INSERT INTO message_fts(message_fts,rank) VALUES('secure-delete',1)")
+        migrated = self.db.execute("SELECT value FROM index_settings WHERE name='fts_privacy_version'").fetchone()
+        if not migrated:
+            # Old FTS segments may contain terms deleted before secure-delete
+            # was enabled. Merge them once; ordinary local reads do not repeat it.
+            self._scrub_fts()
+            self.db.execute("INSERT OR IGNORE INTO index_settings VALUES('fts_privacy_version','1')")
         self.db.commit()
 
     def close(self):
@@ -114,12 +136,35 @@ class HistoryIndex:
         rows = [(self.account, m.conversation_id, m.id, m.sender, m.sender_id,
                  title or m.chat_title, m.timestamp.astimezone(timezone.utc).isoformat(),
                  m.text_content, normalize(m.text_content), int(m.is_from_me)) for m in messages]
+        scrub = False
+        if not self._native_fts_delete:
+            for row in rows:
+                previous = self.db.execute("SELECT search_text FROM messages WHERE account=? AND conv=? AND msg=?", row[:3]).fetchone()
+                if previous and previous["search_text"] != row[8]:
+                    scrub = True
+                    break
         self.db.executemany("""INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(account,conv,msg) DO UPDATE SET sender=excluded.sender,
             sender_id=excluded.sender_id,title=excluded.title,timestamp=excluded.timestamp,
             text=excluded.text,search_text=excluded.search_text,is_from_me=excluded.is_from_me""", rows)
+        if scrub:
+            self._scrub_fts()
         self.db.commit()
         return len(rows)
+
+    def _scrub_fts(self) -> None:
+        """Remove obsolete postings; core secure_delete zeros freed blob pages."""
+        self.db.execute("INSERT INTO message_fts(message_fts) VALUES('optimize')")
+
+    def delete_messages(self, conv: str, message_ids: list[str]) -> None:
+        if not message_ids:
+            return
+        with self.db:
+            previous_changes = self.db.total_changes
+            self.db.executemany("DELETE FROM messages WHERE account=? AND conv=? AND msg=?",
+                                [(self.account, conv, str(mid)) for mid in message_ids])
+            if not self._native_fts_delete and self.db.total_changes > previous_changes:
+                self._scrub_fts()
 
     def record_coverage(self, conv: str, title: str, cutoff: datetime, complete: bool, reason: str | None = None):
         bounds = self.db.execute("SELECT min(timestamp),max(timestamp) FROM messages WHERE account=? AND conv=?",
@@ -237,11 +282,10 @@ def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, m
                 break
             raw = response.get("messages", [])
             # Include tombstones so a repeated sync can remove locally cached deletions.
-            with index.db:
-                for item in raw:
-                    if TeamsClient._is_deleted_message(item):
-                        index.db.execute("DELETE FROM messages WHERE account=? AND conv=? AND msg=?",
-                                         (index.account, chat.id, str(item.get("id", ""))))
+            index.delete_messages(chat.id, [
+                str(item.get("id", item.get("sequenceId", item.get("version", ""))))
+                for item in raw if TeamsClient._is_deleted_message(item)
+            ])
             messages = [Message.from_api(m, my_user_id=client._user_id) for m in raw
                         if m.get("messagetype") in ("Text", "RichText/Html", "RichText")
                         and not TeamsClient._is_deleted_message(m)]

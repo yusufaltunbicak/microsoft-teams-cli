@@ -2,11 +2,14 @@ from datetime import datetime, timedelta, timezone
 import json
 import stat
 import httpx
+import sqlite3
 
 import pytest
 
 from teams_cli.history import HistoryIndex, account_key, normalize, saved_account, sync_history
 from teams_cli import constants
+import teams_cli.history as history_module
+from teams_cli.exceptions import ConfigurationError
 from teams_cli.cli import cli
 import teams_cli.commands.cache as cache_commands
 import teams_cli.commands.search as search_commands
@@ -44,6 +47,139 @@ def test_index_isolates_accounts_updates_and_punctuation(tmp_path, make_message)
     with HistoryIndex("b", path) as index:
         assert index.search("updated") == []
         assert index.status()["messages"] == 0
+
+
+def fts_blocks(index):
+    return b"".join(bytes(row[0]) for row in index.db.execute("SELECT block FROM message_fts_data"))
+
+
+def test_native_fts_secure_delete_removes_updated_and_deleted_terms(tmp_path, make_message):
+    if sqlite3.sqlite_version_info < (3, 42, 0):
+        pytest.skip("Native FTS secure-delete requires SQLite 3.42")
+    path = tmp_path / "native.sqlite3"
+    message = make_message(msg_id="private", text_content="erasurealphatoken")
+    with HistoryIndex("a", path) as index:
+        setting = index.db.execute("SELECT v FROM message_fts_config WHERE k='secure-delete'").fetchone()
+        assert setting[0] == 1
+        index.upsert([message])
+        assert b"erasurealphatoken" in fts_blocks(index)
+        message.text_content = "betareplacementtoken"
+        index.upsert([message])
+        assert b"erasurealphatoken" not in fts_blocks(index)
+        assert b"erasurealphatoken" not in path.read_bytes()
+        assert len(index.search("betareplacementtoken")) == 1
+        index.delete_messages(message.conversation_id, [message.id])
+        assert b"betareplacementtoken" not in fts_blocks(index)
+        assert b"betareplacementtoken" not in path.read_bytes()
+        assert not index.search("betareplacementtoken")
+
+
+def test_existing_fts_residue_is_scrubbed_once(tmp_path, make_message, monkeypatch):
+    runtime = sqlite3.sqlite_version_info
+    monkeypatch.setattr(history_module.sqlite3, "sqlite_version_info", (3, 41, 0))
+    path = tmp_path / "old-index.sqlite3"
+    message = make_message(msg_id="old", text_content="retiredprivacytoken")
+    with HistoryIndex("a", path) as index:
+        index.upsert([message])
+        # Reproduce a pre-fix external-content FTS deletion: SQL matches hide
+        # the row, while its old term still exists in the underlying segment.
+        index.db.execute("DELETE FROM messages")
+        index.db.execute("DELETE FROM index_settings WHERE name='fts_privacy_version'")
+        index.db.commit()
+        assert not index.search("retiredprivacytoken")
+        assert b"retiredprivacytoken" in fts_blocks(index)
+    monkeypatch.setattr(history_module.sqlite3, "sqlite_version_info", runtime)
+    calls = []
+    original_scrub = HistoryIndex._scrub_fts
+
+    def scrub(index):
+        calls.append(index.path)
+        original_scrub(index)
+
+    monkeypatch.setattr(HistoryIndex, "_scrub_fts", scrub)
+    with HistoryIndex("a", path) as index:
+        assert b"retiredprivacytoken" not in fts_blocks(index)
+        assert b"retiredprivacytoken" not in path.read_bytes()
+    with HistoryIndex("a", path) as index:
+        assert not index.search("retiredprivacytoken")
+    assert calls == [path]
+
+
+def test_legacy_fts_scrubs_only_content_changes_and_deletions(tmp_path, make_message, monkeypatch):
+    monkeypatch.setattr(history_module.sqlite3, "sqlite_version_info", (3, 41, 0))
+    calls = []
+    original_scrub = HistoryIndex._scrub_fts
+
+    def scrub(index):
+        calls.append(index.path)
+        original_scrub(index)
+
+    monkeypatch.setattr(HistoryIndex, "_scrub_fts", scrub)
+    path = tmp_path / "legacy.sqlite3"
+    message = make_message(msg_id="private", text_content="erasurealphatoken")
+    with HistoryIndex("a", path) as index:
+        assert not index.db.execute("SELECT v FROM message_fts_config WHERE k='secure-delete'").fetchone()
+        index.upsert([message])
+        index.upsert([message])
+        assert len(index.search("erasurealphatoken")) == 1
+        assert len(calls) == 1  # first migration; inserts and identical text are cheap
+        message.text_content = "betareplacementtoken"
+        index.upsert([message])
+        assert len(calls) == 2
+        assert b"erasurealphatoken" not in fts_blocks(index)
+        assert b"erasurealphatoken" not in path.read_bytes()
+        index.delete_messages(message.conversation_id, [message.id])
+        assert len(calls) == 3
+        assert b"betareplacementtoken" not in fts_blocks(index)
+        assert b"betareplacementtoken" not in path.read_bytes()
+        index.delete_messages(message.conversation_id, ["absent"])
+        assert len(calls) == 3
+    with HistoryIndex("a", path) as index:
+        assert not index.search("erasurealphatoken")
+    assert len(calls) == 3  # ordinary reopen and local search do not optimize
+
+
+def test_native_fts_reopen_does_not_rewrite_configuration(tmp_path, monkeypatch):
+    if sqlite3.sqlite_version_info < (3, 42, 0):
+        pytest.skip("Native FTS secure-delete requires SQLite 3.42")
+    path = tmp_path / "reopen.sqlite3"
+    with HistoryIndex("a", path):
+        pass
+    statements = []
+    connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        db.set_trace_callback(statements.append)
+        return db
+
+    monkeypatch.setattr(history_module.sqlite3, "connect", traced_connect)
+    with HistoryIndex("a", path) as index:
+        assert not index.search("absent")
+    assert not any(statement.lstrip().upper().startswith("INSERT") for statement in statements)
+
+
+def test_native_fts_downgrade_is_actionable(tmp_path, monkeypatch):
+    if sqlite3.sqlite_version_info < (3, 42, 0):
+        pytest.skip("Native FTS secure-delete requires SQLite 3.42")
+    path = tmp_path / "modern.sqlite3"
+    with HistoryIndex("a", path):
+        pass
+    monkeypatch.setattr(history_module.sqlite3, "sqlite_version_info", (3, 41, 0))
+    with pytest.raises(ConfigurationError, match="SQLite 3.42.*teams cache clear"):
+        HistoryIndex("a", path)
+
+
+def test_disabled_native_fts_setting_allows_legacy_runtime(tmp_path, monkeypatch):
+    if sqlite3.sqlite_version_info < (3, 42, 0):
+        pytest.skip("Setting FTS secure-delete requires SQLite 3.42")
+    path = tmp_path / "disabled.sqlite3"
+    with HistoryIndex("a", path) as index:
+        index.db.execute("INSERT INTO message_fts(message_fts,rank) VALUES('secure-delete',0)")
+        index.db.commit()
+    monkeypatch.setattr(history_module.sqlite3, "sqlite_version_info", (3, 41, 0))
+    with HistoryIndex("a", path) as index:
+        assert not index.search("absent")
 
 
 def test_account_key_tenant_boundary_and_offline_expiry(fake_tokens, token_factory, isolated_paths):
