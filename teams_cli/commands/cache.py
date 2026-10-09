@@ -69,18 +69,23 @@ def cache_status(as_json: bool):
         console.print(f"{result['messages']} messages, {result['chats']} chats — local index")
         console.print(f"{result['path']}")
         for row in result["coverage"]:
-            state = "covered" if row["complete"] else "page limit reached"
+            state = "covered" if row["complete"] else (row.get("reason") or "partial")
             console.print(f"{row['title']}: {state}; last sync {row['synced_at']}", markup=False)
 
 
 @cache.command(name="clear")
 @click.option("--messages-only", is_flag=True, help="Remove message index; keep metadata.")
+@click.option("--metadata-only", is_flag=True, help="Reset names/capabilities; keep message history.")
 @click.option("--yes", "-y", is_flag=True, help="Skip local deletion confirmation.")
 @click.option("--json", "as_json", is_flag=True)
 @_handle_api_error
-def cache_clear(messages_only: bool, yes: bool, as_json: bool):
+def cache_clear(messages_only: bool, metadata_only: bool, yes: bool, as_json: bool):
     """Delete local message/metadata files for all cached accounts."""
+    if messages_only and metadata_only:
+        raise click.UsageError("Choose only one of --messages-only and --metadata-only.")
     names = ["history.sqlite3", "history.sqlite3-journal", "history.sqlite3-wal", "history.sqlite3-shm"]
+    if metadata_only:
+        names = []
     if not messages_only:
         names.append("metadata.json")
     if emit_dry_run("clear local cache", {"files": names}, as_json=as_json):

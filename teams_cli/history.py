@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+import httpx
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit, unquote
@@ -93,9 +94,11 @@ class HistoryIndex:
             CREATE TABLE IF NOT EXISTS coverage (
                 account TEXT NOT NULL, conv TEXT NOT NULL, title TEXT NOT NULL,
                 synced_at TEXT NOT NULL, requested_after TEXT NOT NULL,
-                complete INTEGER NOT NULL, oldest TEXT, newest TEXT,
+                complete INTEGER NOT NULL, oldest TEXT, newest TEXT, reason TEXT,
                 PRIMARY KEY(account,conv));
         """)
+        if "reason" not in {r[1] for r in self.db.execute("PRAGMA table_info(coverage)")}:
+            self.db.execute("ALTER TABLE coverage ADD COLUMN reason TEXT")
         self.db.commit()
 
     def close(self):
@@ -118,12 +121,12 @@ class HistoryIndex:
         self.db.commit()
         return len(rows)
 
-    def record_coverage(self, conv: str, title: str, cutoff: datetime, complete: bool):
+    def record_coverage(self, conv: str, title: str, cutoff: datetime, complete: bool, reason: str | None = None):
         bounds = self.db.execute("SELECT min(timestamp),max(timestamp) FROM messages WHERE account=? AND conv=?",
                                  (self.account, conv)).fetchone()
-        self.db.execute("INSERT OR REPLACE INTO coverage VALUES(?,?,?,?,?,?,?,?)",
+        self.db.execute("INSERT OR REPLACE INTO coverage VALUES(?,?,?,?,?,?,?,?,?)",
                         (self.account, conv, title, datetime.now(timezone.utc).isoformat(),
-                         cutoff.isoformat(), int(complete), bounds[0], bounds[1]))
+                         cutoff.isoformat(), int(complete), bounds[0], bounds[1], reason))
         self.db.commit()
 
     @staticmethod
@@ -191,7 +194,7 @@ class HistoryIndex:
     def status(self) -> dict:
         row = self.db.execute("SELECT count(*),min(timestamp),max(timestamp) FROM messages WHERE account=?",
                               (self.account,)).fetchone()
-        coverage = [dict(r) for r in self.db.execute("SELECT title,synced_at,requested_after,complete,oldest,newest FROM coverage WHERE account=?",
+        coverage = [dict(r) for r in self.db.execute("SELECT title,synced_at,requested_after,complete,oldest,newest,reason FROM coverage WHERE account=?",
                                                    (self.account,)).fetchall()]
         return {"path": str(self.path), "messages": row[0], "oldest": row[1], "newest": row[2],
                 "chats": len(coverage), "coverage": coverage, "scope": "indexed chats only",
@@ -217,11 +220,19 @@ def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, m
         params = {"view": "msnp24Equivalent|supportsMessageProperties", "pageSize": 100}
         seen: set[str] = set()
         complete = False
+        reason = "page_limit"
         for _ in range(max_pages):
-            response = client._ic3_get(path, params=params)
+            try:
+                response = client._ic3_get(path, params=params)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (403, 404):
+                    raise
+                reason = "access_denied" if exc.response.status_code == 403 else "unavailable"
+                break
             pages += 1
             if not isinstance(response, dict) or not isinstance(response.get("messages"), list):
                 # A missing/vanished conversation must never look fully indexed.
+                reason = "unavailable"
                 break
             raw = response.get("messages", [])
             # Include tombstones so a repeated sync can remove locally cached deletions.
@@ -241,8 +252,10 @@ def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, m
                      for m in raw if m.get("composetime") or m.get("originalarrivaltime")]
             if not link or (times and min(times) <= cutoff):
                 complete = True
+                reason = None
                 break
             if link in seen:
+                reason = "cursor_repeat"
                 break
             seen.add(link)
             url = urlsplit(link)
@@ -252,5 +265,5 @@ def sync_history(client, index: HistoryIndex, chats: int = 50, days: int = 60, m
                 raise ValueError("Refusing an unexpected history pagination URL.")
             path = url.path[len(base.path):]
             params = {k: v[0] for k, v in parse_qs(url.query).items()}
-        index.record_coverage(chat.id, chat.display_title, cutoff, complete)
+        index.record_coverage(chat.id, chat.display_title, cutoff, complete, reason)
     return {"indexed": fetched, "pages": pages, **index.status()}

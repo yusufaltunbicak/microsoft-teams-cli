@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import stat
+import httpx
 
 import pytest
 
@@ -141,6 +142,39 @@ def test_sync_missing_messages_is_incomplete(tmp_path, make_chat):
     with HistoryIndex("a", tmp_path / "history.sqlite3") as index:
         result = sync_history(Client(), index)
         assert not result["complete"]
+        assert result["coverage"][0]["reason"] == "unavailable"
+
+
+def test_sync_skips_only_inaccessible_chats(tmp_path, make_chat):
+    class Client:
+        _user_id = "me"
+        _chatsvc = "https://teams.cloud.microsoft/api/chatsvc/emea/v1"
+        calls = 0
+        def get_chats(self, top): return [make_chat(chat_id="denied"), make_chat(chat_id="accessible")]
+        def _ic3_get(self, path, params):
+            self.calls += 1
+            if self.calls == 1:
+                response = httpx.Response(403, request=httpx.Request("GET", "https://example.com"))
+                response.raise_for_status()
+            return {"messages": []}
+    with HistoryIndex("a", tmp_path / "history.sqlite3") as index:
+        result = sync_history(Client(), index)
+        assert result["chats"] == 2
+        assert not result["complete"]
+        assert {row["reason"] for row in result["coverage"]} == {"access_denied", None}
+        assert sum(bool(row["complete"]) for row in result["coverage"]) == 1
+
+
+def test_sync_auth_failure_is_not_hidden(tmp_path, make_chat):
+    from teams_cli.exceptions import AuthRequiredError
+    class Client:
+        _user_id = "me"
+        def get_chats(self, top): return [make_chat()]
+        def _ic3_get(self, path, params): raise AuthRequiredError("Run: teams login")
+    with HistoryIndex("a", tmp_path / "history.sqlite3") as index:
+        with pytest.raises(AuthRequiredError):
+            sync_history(Client(), index)
+        assert not index.status()["chats"]
 
 
 def test_local_search_no_auth_or_network(runner, mocker, isolated_paths, fake_tokens, make_message):
@@ -171,6 +205,13 @@ def test_cache_clear_safety_preserves_auth(runner, isolated_paths):
     assert (constants.CACHE_DIR / "metadata.json").exists()
     assert (constants.CACHE_DIR / "tokens.json").exists()
     assert (constants.CACHE_DIR / "scheduled.json").exists()
+    (constants.CACHE_DIR / "history.sqlite3").write_text("preserve")
+    metadata = runner.invoke(cli, ["--force", "cache", "clear", "--metadata-only", "--json"])
+    assert metadata.exit_code == 0
+    assert not (constants.CACHE_DIR / "metadata.json").exists()
+    assert (constants.CACHE_DIR / "history.sqlite3").exists()
+    conflicting = runner.invoke(cli, ["--force", "cache", "clear", "--metadata-only", "--messages-only"])
+    assert conflicting.exit_code == 2
 
 
 def test_watch_minimum_validated_before_network(runner, mocker):
@@ -202,6 +243,63 @@ def test_live_search_context_is_additive(runner, mocker, make_message):
     assert payload["data"][0]["id"] == "anchor"
     assert payload["data"][0]["context"][0]["id"] == "anchor"
     client.get_message_context.assert_called_once_with("1", before=2, after=2)
+
+
+def test_read_context_preserves_message_shape(runner, mocker, make_message):
+    import teams_cli.commands.chat as chat_commands
+    msg = make_message(msg_id="old")
+    client = mocker.Mock()
+    client.get_message_detail.return_value = msg
+    client.get_message_context.return_value = [msg]
+    mocker.patch.object(chat_commands, "_get_client", return_value=client)
+    result = runner.invoke(cli, ["read", "1", "--context", "1", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)["data"]
+    assert data["id"] == "old" and data["context"][0]["id"] == "old"
+
+
+def test_cache_status_without_login(runner, mocker):
+    mocker.patch.object(cache_commands, "_get_client", side_effect=AssertionError("live"))
+    result = runner.invoke(cli, ["cache", "status", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)["data"]
+    assert data["messages"] == 0 and not data["live"]
+
+
+def test_sync_command_only_invokes_read_sync(runner, mocker, fake_tokens):
+    client = mocker.Mock()
+    client._tokens = fake_tokens
+    mocker.patch.object(cache_commands, "_get_client", return_value=client)
+    sync = mocker.patch.object(cache_commands, "sync_history", return_value={"indexed": 2, "chats": 1, "path": "private"})
+    result = runner.invoke(cli, ["--no-input", "sync", "--chats", "1", "--days", "30", "--max-pages", "2", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output)["data"]["indexed"] == 2
+    assert sync.call_args.kwargs == {"chats": 1, "days": 30, "max_pages": 2}
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1])
+def test_invalid_jitter_is_rejected(value):
+    from teams_cli.anti_detection import BrowserSession
+    with pytest.raises(ValueError, match="finite"):
+        BrowserSession(read_jitter_base=value)
+
+
+def test_local_search_pipe_retains_envelope(runner, mocker, isolated_paths, fake_tokens, make_message):
+    import teams_cli.commands._common as common
+    isolated_paths["tokens_file"].write_text(json.dumps(fake_tokens))
+    with HistoryIndex(account_key(fake_tokens)) as index:
+        index.upsert([make_message(text_content="meeting")])
+    mocker.patch.object(common, "is_piped", return_value=True)
+    result = runner.invoke(cli, ["search", "meeting", "--local"])
+    assert result.exit_code == 0
+    assert json.loads(result.output)["ok"]
+
+
+def test_missing_identity_fails_closed():
+    from teams_cli.exceptions import AuthRequiredError
+    for tokens in ({}, [], {"ic3": "invalid", "user_id": "fallback"}):
+        with pytest.raises(AuthRequiredError):
+            account_key(tokens)
 
 
 def test_jitter_config_does_not_mutate_defaults(tmp_path):
