@@ -41,7 +41,7 @@ def _fetch_chats(client, top):
 
 def _fetch_unread(client):
     try:
-        return client.get_chats(top=200, unread_only=True)
+        return client.get_chats(top=200, unread_only=True, assign_nums=False)
     except Exception:
         return []
 

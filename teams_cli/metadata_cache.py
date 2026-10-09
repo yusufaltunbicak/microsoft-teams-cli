@@ -19,7 +19,9 @@ except ImportError:  # pragma: no cover - Windows
 
 class MetadataCache:
     USER_TTL = 7 * 24 * 60 * 60
+    MISSING_USER_TTL = 5 * 60
     CHAT_TTL = 24 * 60 * 60
+    CAPABILITY_TTL = 60 * 60
     MAX_USERS = 5000
     MAX_CHATS = 2000
 
@@ -56,11 +58,21 @@ class MetadataCache:
     def put_many(self, section: str, entries: dict[str, dict], ttl: float | None = None) -> None:
         if not self.enabled or not entries:
             return
-        if section not in ("users", "chats"):
-            raise ValueError("Metadata cache accepts only users and chats")
+        if section not in ("users", "chats", "capabilities"):
+            raise ValueError("Metadata cache accepts only users, chats and capabilities")
         # Whitelist metadata fields rather than trusting callers to exclude message text.
-        allowed = {"display_name"} if section == "users" else {"title", "topic", "members", "chat_type"}
-        expires = time.time() + (ttl if ttl is not None else (self.USER_TTL if section == "users" else self.CHAT_TTL))
+        allowed = ({"display_name", "not_found"} if section == "users" else {"denied"}
+                   if section == "capabilities" else {"title", "topic", "members", "chat_type"})
+        entries = {key: {k: v for k, v in value.items() if k in allowed} for key, value in entries.items()}
+        if section == "capabilities":
+            entries = {key: value for key, value in entries.items() if isinstance(value.get("denied"), bool)}
+        # Repeated live reads usually report unchanged names/titles. Keep their
+        # original expiry rather than rewrite the entire file on each command.
+        entries = {key: value for key, value in entries.items() if self.get(section, key) != value}
+        if not entries:
+            return
+        defaults = {"users": self.USER_TTL, "chats": self.CHAT_TTL, "capabilities": self.CAPABILITY_TTL}
+        expires = time.time() + (ttl if ttl is not None else defaults[section])
         with self._mutex, self._file_lock():
             data = self._read()
             account = data["accounts"].setdefault(self.scope, {})
@@ -68,7 +80,7 @@ class MetadataCache:
             for key, value in entries.items():
                 target[key] = {k: v for k, v in value.items() if k in allowed}
                 target[key]["expires_at"] = expires
-            limit = self.MAX_USERS if section == "users" else self.MAX_CHATS
+            limit = self.MAX_USERS if section == "users" else 20 if section == "capabilities" else self.MAX_CHATS
             now = time.time()
             target = {k: v for k, v in target.items() if isinstance(v, dict) and v.get("expires_at", 0) > now}
             account[section] = dict(sorted(target.items(), key=lambda pair: pair[1]["expires_at"], reverse=True)[:limit])

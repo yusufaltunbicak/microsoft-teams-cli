@@ -160,7 +160,8 @@ class TeamsClient:
     # Chats
     # ------------------------------------------------------------------
 
-    def get_chats(self, top: int = 25, unread_only: bool = False, skip: int = 0, refresh: bool = False) -> list[Chat]:
+    def get_chats(self, top: int = 25, unread_only: bool = False, skip: int = 0,
+                  refresh: bool = False, assign_nums: bool = True) -> list[Chat]:
         """Get recent conversations from IC3 Chat Service."""
         fetch_size = max((top + skip) * 2, 200)
         conversations = self._get_conversations(fetch_size, refresh=refresh)
@@ -186,7 +187,8 @@ class TeamsClient:
         self._resolve_1on1_chat_names(chats)
         self._cache_chat_metadata(chats)
 
-        self._assign_chat_nums(chats)
+        if assign_nums:
+            self._assign_chat_nums(chats)
         return chats
 
     def _get_conversations(self, fetch_size: int = 200, refresh: bool = False) -> list[dict]:
@@ -753,15 +755,20 @@ class TeamsClient:
 
     def get_presence(self) -> dict:
         """Get current presence status, with UPS fallback for tenants that block Graph."""
-        try:
-            return self._graph_get("/me/presence")
-        except (httpx.HTTPStatusError, TokenExpiredError) as exc:
-            # Fall back to UPS if Graph returns 403 (blocked) or 401 (expired)
-            if not self._presence_token:
-                raise
-            if isinstance(exc, httpx.HTTPStatusError):
-                if exc.response is None or exc.response.status_code not in (401, 403):
+        capability = self._metadata.get("capabilities", "graph_presence") or {}
+        if not (self._presence_token and capability.get("denied") is True):
+            try:
+                return self._graph_get("/me/presence")
+            except (httpx.HTTPStatusError, TokenExpiredError) as exc:
+                # Cache only a confirmed permission denial. Expiry and transient
+                # errors must not suppress Graph for the next invocation.
+                if not self._presence_token:
                     raise
+                if isinstance(exc, httpx.HTTPStatusError):
+                    if exc.response is None or exc.response.status_code not in (401, 403):
+                        raise
+                    if exc.response.status_code == 403:
+                        self._metadata.put_many("capabilities", {"graph_presence": {"denied": True}})
 
         resp = self._ups_post(
             "/presence/getpresence/",
@@ -920,10 +927,12 @@ class TeamsClient:
         for msg in messages:
             if msg.sender == msg.sender_id:
                 msg.sender = names.get(msg.sender_id, msg.sender_id)
-        self._metadata.put_many("users", {
+        observed_names = {
             msg.sender_id: {"display_name": msg.sender}
             for msg in messages if msg.sender_id and msg.sender and msg.sender != msg.sender_id
-        })
+        }
+        self._metadata.put_many("users", observed_names)
+        self._user_name_cache.update({uid: value["display_name"] for uid, value in observed_names.items()})
         self._metadata.put_many("chats", {
             msg.conversation_id: {"title": msg.chat_title, "topic": msg.chat_title}
             for msg in messages if msg.conversation_id and msg.chat_title
@@ -1013,28 +1022,30 @@ class TeamsClient:
             else:
                 missing.append(uid)
         resolved: dict[str, dict] = {}
+        not_found: dict[str, dict] = {}
         from urllib.parse import quote
         for start in range(0, len(missing), 20):
             chunk = missing[start:start + 20]
             try:
-                if len(chunk) == 1:
-                    uid = chunk[0]
-                    body = self._graph_get(f"/users/{quote(uid, safe='')}", params={"$select": "id,displayName"})
-                    responses = {uid: body}
-                else:
-                    responses = self._graph_batch_get({
-                        uid: f"/users/{quote(uid, safe='')}?$select=id,displayName"
-                        for uid in chunk
-                    })
+                responses = self._graph_batch_get({
+                    uid: f"/users/{quote(uid, safe='')}?$select=id,displayName"
+                    for uid in chunk
+                })
                 for uid, body in responses.items():
                     name = body.get("displayName", "")
                     if name:
                         names[uid] = name
                         resolved[uid] = {"display_name": name}
+                    elif body.get("_not_found"):
+                        # Directory-deleted/guest IDs can remain in old chats.
+                        # A short 404 cache avoids a repeated failed lookup on
+                        # every invocation; observed web sender names replace it.
+                        not_found[uid] = {"display_name": uid, "not_found": True}
             except (httpx.HTTPStatusError, AuthRequiredError, TokenExpiredError, RateLimitError, RetryableError, KeyError):
                 # Name enrichment must not discard otherwise valid messages.
                 pass
         self._metadata.put_many("users", resolved)
+        self._metadata.put_many("users", not_found, ttl=MetadataCache.MISSING_USER_TTL)
         for uid in missing:
             names.setdefault(uid, uid)
         self._user_name_cache.update(names)
@@ -1862,6 +1873,8 @@ class TeamsClient:
                 body = response.get("body", {})
                 if status == 200 and isinstance(body, dict):
                     results[uid] = body
+                elif status == 404:
+                    results[uid] = {"_not_found": True}
                 elif status == 429:
                     retry[uid] = pending[uid]
                     retry_headers = {k.lower(): str(v) for k, v in response.get("headers", {}).items()}

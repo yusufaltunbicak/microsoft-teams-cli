@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
+import httpx
 import pytest
 
 from teams_cli.client import TeamsClient
@@ -48,7 +50,7 @@ def test_user_names_batched_once_and_reused_across_clients(teams_client, fake_to
     monkeypatch.setattr(teams_client, "_graph_get", lambda path, params=None: {"displayName": "Name u40"})
     users = [f"u{i}" for i in range(41)]
     assert len(teams_client._resolve_user_names(users + users)) == 41
-    assert [len(paths) for paths in batches] == [20, 20]
+    assert [len(paths) for paths in batches] == [20, 20, 1]
     another = TeamsClient(fake_tokens)
     monkeypatch.setattr(another, "_graph_get", lambda *a, **k: pytest.fail("cached names should not need Graph"))
     monkeypatch.setattr(another, "_graph_batch_get", lambda *a, **k: pytest.fail("cached names should not need Graph"))
@@ -177,7 +179,7 @@ def test_search_query_filters_ids_escapes_names_and_includes_before_day():
 
 
 def test_search_before_date_includes_entire_day_and_sender_id_filter(teams_client, make_message, monkeypatch):
-    message = make_message(timestamp=__import__("datetime").datetime(2026, 10, 9, 23, 59, tzinfo=__import__("datetime").timezone.utc), sender="Alice", sender_id="alice-id")
+    message = make_message(timestamp=datetime(2026, 10, 9, 23, 59, tzinfo=timezone.utc), sender="Alice", sender_id="alice-id")
     monkeypatch.setattr(teams_client, "_substrate_search", lambda *a: [message])
     monkeypatch.setattr(teams_client, "_resolve_chat_titles", lambda *a: None)
     result = teams_client.search_messages("meeting", from_filter="alice-id", before="2026-10-09")
@@ -191,3 +193,96 @@ def test_message_number_identity_includes_conversation(teams_client, make_messag
     assert first.display_num != second.display_num
     assert teams_client._resolve_message_id(str(first.display_num))["conv"] == "first"
     assert teams_client._resolve_message_id(str(second.display_num))["conv"] == "second"
+
+
+def test_unchanged_fresh_metadata_avoids_disk_write(tmp_path, monkeypatch):
+    cache = MetadataCache(tmp_path, "tenant:user")
+    entry = {"alice": {"display_name": "Alice"}}
+    cache.put_many("users", entry)
+    monkeypatch.setattr(cache, "_write", lambda *a: pytest.fail("unchanged fresh cache must avoid I/O"))
+    cache.put_many("users", entry)
+
+
+def test_missing_directory_user_is_cached_briefly_and_replaced_by_observed_name(teams_client, fake_tokens, monkeypatch):
+    monkeypatch.setattr(teams_client, "_graph_batch_get", lambda *a, **k: {"removed-user": {"_not_found": True}})
+    assert teams_client._resolve_user_name("removed-user") == "removed-user"
+    another = TeamsClient(fake_tokens)
+    monkeypatch.setattr(another, "_graph_batch_get", lambda *a, **k: pytest.fail("404 should be cached across CLI processes"))
+    assert another._resolve_user_name("removed-user") == "removed-user"
+    assert another._metadata.get("users", "removed-user")["not_found"]
+    another._metadata.put_many("users", {"removed-user": {"display_name": "Restored User"}})
+    refreshed = TeamsClient(fake_tokens)
+    assert refreshed._resolve_user_name("removed-user") == "Restored User"
+    assert "not_found" not in refreshed._metadata.get("users", "removed-user")
+
+
+def test_directory_failure_cache_distinguishes_404_from_other_statuses(teams_client, monkeypatch):
+    monkeypatch.setattr(teams_client, "_request_with_retry", lambda *a, **k: {"responses": [
+        {"id": "missing", "status": 404},
+        {"id": "denied", "status": 403},
+        {"id": "expired", "status": 401},
+        {"id": "empty", "status": 200, "body": {}},
+    ]})
+    teams_client._resolve_user_names(["missing", "denied", "expired", "empty"])
+    assert teams_client._metadata.get("users", "missing")["not_found"]
+    assert all(teams_client._metadata.get("users", uid) is None for uid in ("denied", "expired", "empty"))
+
+
+def test_summary_unread_does_not_replace_recent_chat_numbers(teams_client, monkeypatch):
+    from teams_cli.commands.summary import _fetch_unread
+    teams_client._update_id_map(lambda value: value["chats"].update({"1": "recent-chat"}))
+    monkeypatch.setattr(teams_client, "_get_conversations", lambda *a, **k: [{
+        "id": "unread-chat", "threadProperties": {"topic": "Unread", "unreadMessageCount": 1},
+    }])
+    _fetch_unread(teams_client)
+    assert teams_client._id_map["chats"] == {"1": "recent-chat"}
+
+
+def test_graph_presence_403_cached_only_with_ups_and_expires(teams_client, fake_tokens, monkeypatch):
+    request = httpx.Request("GET", "https://graph.microsoft.com/v1.0/me/presence")
+    def denied(*a, **k):
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("denied", request=request, response=response)
+    monkeypatch.setattr(teams_client, "_graph_get", denied)
+    ups_calls = []
+    def ups(*a, **k):
+        ups_calls.append(1)
+        return [{"presence": {"availability": "Available"}}]
+    monkeypatch.setattr(teams_client, "_ups_post", ups)
+    assert teams_client.get_presence()["availability"] == "Available"
+    assert teams_client._metadata.get("capabilities", "graph_presence") == {"denied": True}
+    another = TeamsClient(fake_tokens)
+    monkeypatch.setattr(another, "_graph_get", lambda *a: pytest.fail("warm denial should avoid failed Graph request"))
+    monkeypatch.setattr(another, "_ups_post", ups)
+    assert another.get_presence()["availability"] == "Available"
+    monkeypatch.setattr("teams_cli.metadata_cache.time.time", lambda: 10**12)
+    graph_calls = []
+    monkeypatch.setattr(another, "_graph_get", lambda *a: graph_calls.append(1) or {"availability": "Busy"})
+    assert another.get_presence()["availability"] == "Busy"
+    assert graph_calls == [1] and len(ups_calls) == 2
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_other_presence_errors_do_not_persist_permission_denial(teams_client, monkeypatch, status):
+    request = httpx.Request("GET", "https://graph.microsoft.com/v1.0/me/presence")
+    def fail(*a, **k):
+        raise httpx.HTTPStatusError("error", request=request, response=httpx.Response(status, request=request))
+    monkeypatch.setattr(teams_client, "_graph_get", fail)
+    monkeypatch.setattr(teams_client, "_ups_post", lambda *a: [{"presence": {"availability": "Available"}}])
+    if status == 401:
+        assert teams_client.get_presence()["availability"] == "Available"
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            teams_client.get_presence()
+    assert teams_client._metadata.get("capabilities", "graph_presence") is None
+
+
+def test_presence_denial_without_ups_remains_graph_error(teams_client, monkeypatch):
+    teams_client._presence_token = ""
+    request = httpx.Request("GET", "https://graph.microsoft.com/v1.0/me/presence")
+    def denied(*a, **k):
+        raise httpx.HTTPStatusError("denied", request=request, response=httpx.Response(403, request=request))
+    monkeypatch.setattr(teams_client, "_graph_get", denied)
+    with pytest.raises(httpx.HTTPStatusError):
+        teams_client.get_presence()
+    assert teams_client._metadata.get("capabilities", "graph_presence") is None
